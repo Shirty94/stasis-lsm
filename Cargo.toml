@@ -1,0 +1,12 @@
+[package]
+name = "stasis-lsm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+libbpf-rs = "0.27.0"
+
+[build-dependencies]
+libbpf-cargo = "0.27.0"
+vmlinux = { git = "https://github.com/libbpf/vmlinux.h.git", rev = "c32912840154a82205530cd6d498b346ac73a6d1" }
