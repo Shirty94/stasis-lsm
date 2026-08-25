@@ -12,7 +12,6 @@ use std::mem::MaybeUninit;
 
 fn main() -> anyhow::Result<()> {
 
-
     let skel_builder = StasisLsmSkelBuilder::default();
 
     let mut open_obj = MaybeUninit::<OpenObject>::uninit();
@@ -21,7 +20,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut skel = open_skel.load()?;
 
-    let ringbuf_map = &skel.maps.my_ringbuf;
+    let rb_map = &skel.maps.my_ringbuf;
 
     let mut rb_builder = libbpf_rs::RingBufferBuilder::new();
 
@@ -31,10 +30,6 @@ fn main() -> anyhow::Result<()> {
     // });
 
     skel.attach()?;
-
-    // let skel = StasisLsmSkelBuilder::default()
-    //     .open(&mut open_obj)?
-    //     .load()?;
 
     println!("BPF program loaded!");
 
