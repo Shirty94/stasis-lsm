@@ -9,6 +9,20 @@ use libbpf_rs::{
 };
 use std::mem::MaybeUninit;
 
+use plain::Plain;
+
+// mirroring the C-struct
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FileOpenSample {
+    pid: u32,
+    flags: u32,
+    timestamp: u64,
+    path: [u8; 256],
+}
+
+unsafe impl Plain for FileOpenSample {}
+
 fn main() -> anyhow::Result<()> {
 
     let skel_builder = StasisLsmSkelBuilder::default();
