@@ -4,11 +4,10 @@ use std::fs;
 use std::path::PathBuf;
 
 fn main() {
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
-    // 1. Copy vmlinux.h into your project so LSP can find it
+    // copy vmlinux.h into project for clangd
     let vmlinux_source = vmlinux::include_path_root()
         .join(&arch)
         .join("vmlinux.h");
@@ -19,7 +18,7 @@ fn main() {
 
     let vmlinux_local_path = "src/bpf/include".to_string();
 
-    // 2. Find libbpf include path using pkg-config
+    // find libbpf include path
     let libbpf_include = pkg_config::probe_library("libbpf")
         .expect("libbpf not found via pkg-config")
         .include_paths
@@ -30,14 +29,15 @@ fn main() {
         .unwrap()
         .to_owned();
 
-    // 3. Build the skeleton
+    // build the skeleton
+    let skel_path = manifest_dir.join("src/bpf/stasis_lsm.skel.rs");
     SkeletonBuilder::new()
         .source("src/bpf/stasis_lsm.bpf.c")
         .clang_args([
             "-I", &vmlinux_local_path,
             "-I", &libbpf_include,
         ])
-        .build_and_generate(out_dir.join("stasis_lsm.skel.rs"))
+        .build_and_generate(skel_path)
         .unwrap();
 
     println!("cargo:rerun-if-changed=src/bpf/stasis_lsm.bpf.c");

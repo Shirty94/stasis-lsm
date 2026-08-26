@@ -1,5 +1,5 @@
 mod bpf {
-    include!(concat!(env!("OUT_DIR"), "/stasis_lsm.skel.rs"));
+    include!("bpf/stasis_lsm.skel.rs");
 }
 
 use bpf::*;
