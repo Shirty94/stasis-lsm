@@ -570,6 +570,7 @@ dependencies = [
  "anyhow",
  "libbpf-cargo",
  "libbpf-rs",
+ "pkg-config",
  "vmlinux",
 ]
 
