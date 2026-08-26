@@ -20,20 +20,18 @@ fn main() -> anyhow::Result<()> {
 
     let mut skel = open_skel.load()?;
 
-    let rb_map = &skel.maps.my_ringbuf;
-
-    let mut rb_builder = libbpf_rs::RingBufferBuilder::new();
-
-    // rb_builder.add(ringbuf_map, |data| {
-    //     println!("Received data: {}", data);
-    //     0
-    // });
-
     skel.attach()?;
 
-    println!("BPF program loaded!");
+    let rb_map = &skel.maps.pid_ringbuf;
+
+    let mut rb_builder = libbpf_rs::RingBufferBuilder::new();
+    rb_builder.add(rb_map, |data| {
+        println!("Received data length: {}", data.len());
+        0
+    })?;
+    let ringbuf = rb_builder.build()?;
 
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(60));
+        ringbuf.poll(std::time::Duration::from_millis(100))?;
     }
 }
