@@ -1,7 +1,6 @@
 mod bpf {
     include!("bpf/stasis_lsm.skel.rs");
 }
-
 use bpf::*;
 
 use libbpf_rs::{
