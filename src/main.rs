@@ -35,11 +35,11 @@ fn main() -> anyhow::Result<()> {
 
     skel.attach()?;
 
-    let _rb_map = &skel.maps.pid_ringbuf;
+    let _rb_map = &skel.maps.event_rb;
 
     let mut rb_builder = libbpf_rs::RingBufferBuilder::new();
 
-    rb_builder.add(&skel.maps.pid_ringbuf, |data| {
+    rb_builder.add(&skel.maps.event_rb, |data| {
         // sanity check
         if data.len() != std::mem::size_of::<FileOpenSample>() {
             eprintln!("Unexpected data size: {}", data.len());

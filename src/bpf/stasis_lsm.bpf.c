@@ -14,8 +14,26 @@ struct rb_fopen_sample {
 
 struct {
   __uint(type, BPF_MAP_TYPE_RINGBUF); // type of the bpf map
-  __uint(max_entries, 256 * 1024);    // Size in bytes
-} pid_ringbuf SEC(".maps");
+  __uint(max_entries, 256 * 1024);    // size in bytes
+} event_rb SEC(".maps");
+
+// ignore whitelisted processes entirely
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 10240);
+  __uint(key_size, sizeof(u32));
+  __uint(value_size, sizeof(u8));
+} whitelist SEC(".maps");
+
+// block blacklisted processes
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  // honestly way too many for the bl, but it's just 200KB, acceptable for a
+  // prototype
+  __uint(max_entries, 10240);
+  __uint(key_size, sizeof(u32));
+  __uint(value_size, sizeof(u8));
+} blacklist SEC(".maps");
 
 static bool str_has_prefix(const char *str, const char *pfx)
 {
@@ -34,7 +52,7 @@ static bool contains_dot_cache(const char *str)
   // pattern is "/.cache/" (8 chars)
   for (int i = 0; i < MAX_PATH_LEN - 7; i++) {
     // we stop when there are fewer than 8 chars left
-    if (str[i + 7] == '\0')
+    if (str[i] == '\0' || str[i + 7] == '\0')
       break;
 
     // pattern matching
@@ -62,8 +80,8 @@ static bool should_ignore_path(const char *path)
     "/sys",
     "/run",
     "/var/cache",
-    "/mnt", // ignore for now to reduce noise. |:TODO:| deactivate
-            // this after finding a better solution
+    "anon_inode",
+    "/mnt/c", // ignore WSL stuff for now
   };
 
   if (path[0] == '\0')
@@ -88,10 +106,19 @@ int BPF_PROG(file_open, struct file *file) {
   // initialize sample
   struct rb_fopen_sample *sample;
   char fpath_buf[MAX_PATH_LEN];
+  u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+  // if process is whitelisted: ignore it
+  if (bpf_map_lookup_elem(&whitelist, &pid))
+    return 0;
+
+  // if process is blacklisted: block it's execution
+  if (bpf_map_lookup_elem(&blacklist, &pid))
+    return -1;
 
   long ret = bpf_d_path(&file->f_path, fpath_buf, sizeof(fpath_buf));
   if (ret < 0) {
-    //bpf_printk("file_open: bpf_d_path failed, ret=%ld\n", ret);
+    bpf_printk("file_open: bpf_d_path failed, ret=%ld\n", ret);
     return 0; // path resolution failed
   }
 
@@ -104,7 +131,7 @@ int BPF_PROG(file_open, struct file *file) {
   bpf_printk("[DBG] file_open: fpath=%s\n", fpath_buf);
 
   // reserve space for our sample
-  sample = bpf_ringbuf_reserve(&pid_ringbuf, sizeof(struct rb_fopen_sample), 0);
+  sample = bpf_ringbuf_reserve(&event_rb, sizeof(struct rb_fopen_sample), 0);
   if (!sample) {
     // ring buffer full -> drop
     return 0;
@@ -112,7 +139,7 @@ int BPF_PROG(file_open, struct file *file) {
 
   // get current PID
   // bpf_get_current_pid_tgid() returns (PID << 32) | TGID
-  sample->pid = bpf_get_current_pid_tgid() >> 32;
+  sample->pid = pid;
   sample->flags = file->f_flags;
   sample->timestamp = bpf_ktime_get_ns();
   bpf_probe_read_str(sample->path, sizeof(sample->path), fpath_buf);
