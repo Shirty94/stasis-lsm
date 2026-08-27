@@ -62,6 +62,8 @@ static bool should_ignore_path(const char *path)
     "/sys",
     "/run",
     "/var/cache",
+    "/mnt", // ignore for now to reduce noise. |:TODO:| deactivate
+            // this after finding a better solution
   };
 
   if (path[0] == '\0')
@@ -99,7 +101,7 @@ int BPF_PROG(file_open, struct file *file) {
   /* if (str_has_prefix(fpath_buf, "/proc/")) */
   /*   bpf_printk("file_open proc: fpath=%s\n", fpath_buf); */
 
-  /* bpf_printk("file_open all: fpath=%s\n", fpath_buf); */
+  bpf_printk("[DBG] file_open: fpath=%s\n", fpath_buf);
 
   // reserve space for our sample
   sample = bpf_ringbuf_reserve(&pid_ringbuf, sizeof(struct rb_fopen_sample), 0);
