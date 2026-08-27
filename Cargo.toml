@@ -7,6 +7,8 @@ edition = "2024"
 anyhow = "1.0.104"
 libbpf-rs = "0.27.0"
 plain = "0.2.3"
+rand = "0.10.2"
+tokio = "1.53.1"
 
 [build-dependencies]
 libbpf-cargo = "0.27.0"
