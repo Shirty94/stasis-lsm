@@ -4,12 +4,11 @@ mod bpf {
 use bpf::*;
 
 use libbpf_rs::{
-    OpenObject,
-    skel::{OpenSkel, SkelBuilder, Skel},
+    MapCore, OpenObject,
+    skel::{OpenSkel, Skel, SkelBuilder},
 };
-use std::mem::MaybeUninit;
-
 use plain::Plain;
+use std::mem::MaybeUninit;
 
 // mirroring the C-struct
 #[repr(C)]
@@ -24,37 +23,56 @@ struct FileOpenSample {
 unsafe impl Plain for FileOpenSample {}
 
 fn main() -> anyhow::Result<()> {
+    // extensible vector of ignored paths
+    let mut _ignored_paths: Vec<&str> = vec![
+        "/tmp",
+        "/dev",
+        "/var/cache",
+        "anon_inode:",
+        "/mnt/c", // ignore WSL stuff for now
+    ];
 
     let skel_builder = StasisLsmSkelBuilder::default();
 
     let mut open_obj = MaybeUninit::<OpenObject>::uninit();
-
     let open_skel = skel_builder.open(&mut open_obj)?;
 
     let mut skel = open_skel.load()?;
-
     skel.attach()?;
 
-    let _rb_map = &skel.maps.event_rb;
+    let ignored_prefixes_map = &skel.maps.ignored_prefixes;
+
+    for (i, path_pfx) in _ignored_paths.iter().enumerate() {
+        let mut value = [0u8; 256];
+        value[..path_pfx.len()].copy_from_slice(path_pfx.as_bytes());
+
+        // array maps use a 32-bit integer as the key/index
+        let key = (i as u32).to_ne_bytes();
+
+        ignored_prefixes_map.update(&key, &value, libbpf_rs::MapFlags::ANY)?;
+    }
+
+    let rb_map = &skel.maps.event_rb;
 
     let mut rb_builder = libbpf_rs::RingBufferBuilder::new();
 
-    rb_builder.add(&skel.maps.event_rb, |data| {
+    rb_builder.add(rb_map, |data| {
         // sanity check
         if data.len() != std::mem::size_of::<FileOpenSample>() {
             eprintln!("Unexpected data size: {}", data.len());
             return -1;
         }
 
-        let sample: FileOpenSample = *plain::from_bytes(data)
-            .expect("Failed to parse FileOpenSample");
+        let sample: FileOpenSample =
+            *plain::from_bytes(data).expect("Failed to parse FileOpenSample");
 
-        // Convert the path byte array to a Rust &str
-        let path_len = sample.path.iter()
+        // convert the path byte array to a Rust &str
+        let path_len = sample
+            .path
+            .iter()
             .position(|&b| b == 0)
             .unwrap_or(sample.path.len());
-        let path_str = std::str::from_utf8(&sample.path[..path_len])
-            .unwrap_or("<invalid UTF-8>");
+        let path_str = std::str::from_utf8(&sample.path[..path_len]).unwrap_or("<invalid UTF-8>");
 
         println!(
             "PID {} opened {} (flags 0x{:x}) at {}",

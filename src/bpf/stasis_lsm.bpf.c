@@ -44,16 +44,24 @@ struct {
   __uint(value_size, sizeof(u8));
 } blacklist SEC(".maps");
 
-static bool str_has_prefix(const char *str, const char *pfx)
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 32);
+  __uint(key_size, sizeof(u32));
+  __uint(value_size, MAX_PATH_LEN);
+} ignored_prefixes SEC(".maps");
+
+static __attribute__((noinline)) bool str_has_prefix(const char *str, const char *pfx)
 {
-  // Check up to MAX_PATH_LEN. If we hit a null byte, the loop stops.
   for (int i = 0; i < MAX_PATH_LEN; i++) {
     if (pfx[i] == '\0')
-      return true; // reached end of prefix, matched completely
+      return true; // Reached end of prefix, it's a match!
     if (str[i] != pfx[i])
-      return false; // end of string or mismatch
+      return false;
   }
-  return false; // should not be reached if strings are valid
+  return false;
+}
+
 static inline bool is_virtual_fs(struct file *file) {
   unsigned long magic = BPF_CORE_READ(file, f_path.dentry, d_sb, s_magic);
 
@@ -95,81 +103,75 @@ static bool contains_dot_cache(const char *str)
   return false;
 }
 
+
+
 static bool should_ignore_path(const char *path)
 {
-  // directories to ignore entirely (simple prefix check)
-  const char *ignore_prefixes[] = {
-    "/tmp",
-    "/dev",
-    "/proc",
-    "/sys",
-    "/run",
-    "/var/cache",
-    "anon_inode",
-    "/mnt/c", // ignore WSL stuff for now
-  };
-
   if (path[0] == '\0')
     return true;
 
-  // match prefixes
-  for (int i = 0; i < sizeof(ignore_prefixes)/sizeof(ignore_prefixes[0]); i++) {
-    if (str_has_prefix(path, ignore_prefixes[i]) == 1)
+  // Check the dynamic prefixes in our array map
+  #pragma unroll
+  for (u32 i = 0; i < 32; i++) {
+    u32 key = i;
+    char *prefix = bpf_map_lookup_elem(&ignored_prefixes, &key);
+
+    // If the prefix is empty or null, skip it
+    if (!prefix || prefix[0] == '\0')
+      continue;
+
+    if (str_has_prefix(path, prefix)) {
       return true;
+    }
   }
 
-  // ignore cache files
-  if (contains_dot_cache(path) == 1)
-    return true;
-
-  return false;
+  return contains_dot_cache(path);
 }
 
-// monitoring function for file_open calls
 SEC("lsm.s/file_open")
 int BPF_PROG(file_open, struct file *file) {
-  // initialize sample
   struct rb_fopen_sample *sample;
-  char fpath_buf[MAX_PATH_LEN];
   u32 pid = bpf_get_current_pid_tgid() >> 32;
 
-  // if process is whitelisted: ignore it
+  // whitelist / blacklist checks
   if (bpf_map_lookup_elem(&whitelist, &pid))
     return 0;
 
-  // if process is blacklisted: block it's execution
   if (bpf_map_lookup_elem(&blacklist, &pid))
     return -1;
 
+  // superblock check
+  if (is_virtual_fs(file)) {
+    return 0;
+  }
+
+  // allocate 256 bytes on the stack for the resolved path
+  char fpath_buf[MAX_PATH_LEN] = {0};
+
+  // resolve path directly into our buffer
   long ret = bpf_d_path(&file->f_path, fpath_buf, sizeof(fpath_buf));
   if (ret < 0) {
     bpf_printk("file_open: bpf_d_path failed, ret=%ld\n", ret);
-    return 0; // path resolution failed
+    return 0;
   }
 
+  // run matching logic (checks dynamic array + contains_dot_cache)
   if (should_ignore_path(fpath_buf))
     return 0;
 
-  /* if (str_has_prefix(fpath_buf, "/proc/")) */
-  /*   bpf_printk("file_open proc: fpath=%s\n", fpath_buf); */
-
   bpf_printk("[DBG] file_open: fpath=%s\n", fpath_buf);
 
-  // reserve space for our sample
+  // reserve space in ring buffer
   sample = bpf_ringbuf_reserve(&event_rb, sizeof(struct rb_fopen_sample), 0);
   if (!sample) {
-    // ring buffer full -> drop
     return 0;
   }
 
-  // get current PID
-  // bpf_get_current_pid_tgid() returns (PID << 32) | TGID
   sample->pid = pid;
   sample->flags = file->f_flags;
   sample->timestamp = bpf_ktime_get_ns();
   bpf_probe_read_str(sample->path, sizeof(sample->path), fpath_buf);
 
-  // submit sample to userspace
   bpf_ringbuf_submit(sample, 0);
 
   return 0;
