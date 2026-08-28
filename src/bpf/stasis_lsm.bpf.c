@@ -44,6 +44,13 @@ struct {
   __uint(value_size, sizeof(u8));
 } blacklist SEC(".maps");
 
+/* note: I did try to use 'BPF_MAP_TYPE_LPM_TRIE' for longest prefix
+   matching, as it would be infinitely more efficient, but that
+   doesn't work unfortunately. This is due to the fact that in order
+   to get the file path with 'bpf_d_path()' we need our file_open-hook
+   to be sleepable. Unfortunately 'BPF_MAP_TYP_LPM_TRIE' doesn't
+   support sleepable execution. */
+
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
   __uint(max_entries, 32);
