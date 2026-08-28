@@ -1,9 +1,18 @@
 #include "include/vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
-// #include <bpf/bpf_core_read.h> maybe needed later on?
+#include <bpf/bpf_core_read.h>
 
 #define MAX_PATH_LEN 256
+
+#define PROC_SUPER_MAGIC 0x9FA0
+#define SYSFS_MAGIC 0x62656572
+#define TMPFS_MAGIC 0x01021994
+#define DEVPTS_SUPER_MAGIC 0x1CD1
+#define CGROUP_SUPER_MAGIC 0x27E0EB
+#define CGROUP2_SUPER_MAGIC 0x63677270
+#define BPF_FS_MAGIC 0xCAFE4A11
+#define ANON_INODE_FS_MAGIC 0x09041901
 
 struct rb_fopen_sample {
     u32 pid;
@@ -45,6 +54,22 @@ static bool str_has_prefix(const char *str, const char *pfx)
       return false; // end of string or mismatch
   }
   return false; // should not be reached if strings are valid
+static inline bool is_virtual_fs(struct file *file) {
+  unsigned long magic = BPF_CORE_READ(file, f_path.dentry, d_sb, s_magic);
+
+  switch (magic) {
+  case PROC_SUPER_MAGIC:
+  case SYSFS_MAGIC:
+  case TMPFS_MAGIC:
+  case DEVPTS_SUPER_MAGIC:
+  case CGROUP_SUPER_MAGIC:
+  case CGROUP2_SUPER_MAGIC:
+  case BPF_FS_MAGIC:
+  case ANON_INODE_FS_MAGIC:
+    return true;
+  default:
+    return false;
+    }
 }
 
 static bool contains_dot_cache(const char *str)
