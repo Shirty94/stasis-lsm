@@ -1,7 +1,7 @@
 #include "include/vmlinux.h"
+#include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
-#include <bpf/bpf_core_read.h>
 
 #define MAX_PATH_LEN 256
 
@@ -15,10 +15,10 @@
 #define ANON_INODE_FS_MAGIC 0x09041901
 
 struct rb_fopen_sample {
-    u32 pid;
-    u32 flags; // open flags
-    u64 timestamp; // bpf_ktime_get_ns()
-    char path[MAX_PATH_LEN]; // full path
+  u32 pid;
+  u32 flags;               // open flags
+  u64 timestamp;           // bpf_ktime_get_ns()
+  char path[MAX_PATH_LEN]; // full path
 };
 
 struct {
@@ -51,8 +51,7 @@ struct {
   __uint(value_size, MAX_PATH_LEN);
 } ignored_prefixes SEC(".maps");
 
-static __always_inline bool str_has_prefix(const char *str, const char *pfx)
-{
+static __always_inline bool str_has_prefix(const char *str, const char *pfx) {
   for (int i = 0; i < MAX_PATH_LEN; i++) {
     if (pfx[i] == '\0')
       return true; // Reached end of prefix, it's a match!
@@ -77,11 +76,10 @@ static inline bool is_virtual_fs(struct file *file) {
     return true;
   default:
     return false;
-    }
+  }
 }
 
-static bool contains_dot_cache(const char *str)
-{
+static bool contains_dot_cache(const char *str) {
   // pattern is "/.cache/" (8 chars)
   for (int i = 0; i < MAX_PATH_LEN - 7; i++) {
     // we stop when there are fewer than 8 chars left
@@ -89,14 +87,9 @@ static bool contains_dot_cache(const char *str)
       break;
 
     // pattern matching
-    if (str[i] == '/' &&
-        str[i+1] == '.' &&
-        str[i+2] == 'c' &&
-        str[i+3] == 'a' &&
-        str[i+4] == 'c' &&
-        str[i+5] == 'h' &&
-        str[i+6] == 'e' &&
-        str[i+7] == '/') {
+    if (str[i] == '/' && str[i + 1] == '.' && str[i + 2] == 'c' &&
+        str[i + 3] == 'a' && str[i + 4] == 'c' && str[i + 5] == 'h' &&
+        str[i + 6] == 'e' && str[i + 7] == '/') {
       return true;
     }
   }
@@ -109,8 +102,7 @@ struct loop_ctx {
 };
 
 // verified in isolation, won't kill complexity
-static int check_prefix_cb(u32 index, void *data)
-{
+static int check_prefix_cb(u32 index, void *data) {
   struct loop_ctx *ctx = data;
   u32 key = index;
 
@@ -126,15 +118,11 @@ static int check_prefix_cb(u32 index, void *data)
   return 0; // continue loop
 }
 
-static bool should_ignore_path(const char *path)
-{
+static bool should_ignore_path(const char *path) {
   if (path[0] == '\0')
     return true;
 
-  struct loop_ctx ctx = {
-    .path = path,
-    .matched = false
-  };
+  struct loop_ctx ctx = {.path = path, .matched = false};
 
   // run the loop 32 times using the helper
   bpf_loop(32, check_prefix_cb, &ctx, 0);
