@@ -8,9 +8,7 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
     // copy vmlinux.h into project for clangd
-    let vmlinux_source = vmlinux::include_path_root()
-        .join(&arch)
-        .join("vmlinux.h");
+    let vmlinux_source = vmlinux::include_path_root().join(&arch).join("vmlinux.h");
     let dest_dir = manifest_dir.join("src/bpf/include");
     let dest_path = dest_dir.join("vmlinux.h");
     fs::create_dir_all(&dest_dir).unwrap();
@@ -33,10 +31,7 @@ fn main() {
     let skel_path = manifest_dir.join("src/bpf/stasis_lsm.skel.rs");
     SkeletonBuilder::new()
         .source("src/bpf/stasis_lsm.bpf.c")
-        .clang_args([
-            "-I", &vmlinux_local_path,
-            "-I", &libbpf_include,
-        ])
+        .clang_args(["-I", &vmlinux_local_path, "-I", &libbpf_include])
         .build_and_generate(skel_path)
         .unwrap();
 
