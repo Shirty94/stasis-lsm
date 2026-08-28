@@ -51,7 +51,7 @@ struct {
   __uint(value_size, MAX_PATH_LEN);
 } ignored_prefixes SEC(".maps");
 
-static __attribute__((noinline)) bool str_has_prefix(const char *str, const char *pfx)
+static __always_inline bool str_has_prefix(const char *str, const char *pfx)
 {
   for (int i = 0; i < MAX_PATH_LEN; i++) {
     if (pfx[i] == '\0')
@@ -103,27 +103,44 @@ static bool contains_dot_cache(const char *str)
   return false;
 }
 
+struct loop_ctx {
+  const char *path;
+  bool matched;
+};
 
+// verified in isolation, won't kill complexity
+static int check_prefix_cb(u32 index, void *data)
+{
+  struct loop_ctx *ctx = data;
+  u32 key = index;
+
+  char *prefix = bpf_map_lookup_elem(&ignored_prefixes, &key);
+  if (!prefix || prefix[0] == '\0')
+    return 0; // continue to next index
+
+  if (str_has_prefix(ctx->path, prefix)) {
+    ctx->matched = true;
+    return 1; // break loop early
+  }
+
+  return 0; // continue loop
+}
 
 static bool should_ignore_path(const char *path)
 {
   if (path[0] == '\0')
     return true;
 
-  // Check the dynamic prefixes in our array map
-  #pragma unroll
-  for (u32 i = 0; i < 32; i++) {
-    u32 key = i;
-    char *prefix = bpf_map_lookup_elem(&ignored_prefixes, &key);
+  struct loop_ctx ctx = {
+    .path = path,
+    .matched = false
+  };
 
-    // If the prefix is empty or null, skip it
-    if (!prefix || prefix[0] == '\0')
-      continue;
+  // run the loop 32 times using the helper
+  bpf_loop(32, check_prefix_cb, &ctx, 0);
 
-    if (str_has_prefix(path, prefix)) {
-      return true;
-    }
-  }
+  if (ctx.matched)
+    return true;
 
   return contains_dot_cache(path);
 }
