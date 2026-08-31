@@ -20,14 +20,14 @@ fn main() -> anyhow::Result<()> {
         "/mnt/c", // ignore WSL stuff for now
     ];
 
-    // Initialize eBPF
+    // initialize eBPF
     let skel_builder = bpf::skeleton::StasisLsmSkelBuilder::default();
     let mut open_obj = MaybeUninit::<OpenObject>::uninit();
     let open_skel = skel_builder.open(&mut open_obj)?;
     let mut skel = open_skel.load()?;
     skel.attach()?;
 
-    // Populate BPF map with ignored prefixes
+    // populate BPF map with ignored prefixes
     let ignored_prefixes_map = &skel.maps.ignored_prefixes;
     for (i, path_pfx) in ignored_paths.iter().enumerate() {
         let mut value = [0u8; 256];
@@ -36,7 +36,7 @@ fn main() -> anyhow::Result<()> {
         ignored_prefixes_map.update(&key, &value, libbpf_rs::MapFlags::ANY)?;
     }
 
-    // Set up RingBuffer
+    // set up RingBuffer
     let rb_map = &skel.maps.event_rb;
     let mut rb_builder = libbpf_rs::RingBufferBuilder::new();
 

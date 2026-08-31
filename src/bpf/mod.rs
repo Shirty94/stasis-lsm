@@ -18,7 +18,11 @@ unsafe impl Plain for FileOpenSample {}
 impl FileOpenSample {
     /// helper to convert raw C-string path to safe Rust string
     pub fn path_str(&self) -> &str {
-        let len = self.path.iter().position(|&b| b == 0).unwrap_or(self.path.len());
+        let len = self
+            .path
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.path.len());
         std::str::from_utf8(&self.path[..len]).unwrap_or("<invalid UTF-8>")
     }
 }
