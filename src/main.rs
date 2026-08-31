@@ -51,12 +51,7 @@ fn main() -> anyhow::Result<()> {
             *plain::from_bytes(data).expect("Failed to parse FileOpenSample");
 
         // convert the path byte array to a Rust &str
-        let path_len = sample
-            .path
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(sample.path.len());
-        let path_str = std::str::from_utf8(&sample.path[..path_len]).unwrap_or("<invalid UTF-8>");
+        let path_str = sample.path_str();
 
         println!(
             "PID {} opened {} (flags 0x{:x}) at {}",
