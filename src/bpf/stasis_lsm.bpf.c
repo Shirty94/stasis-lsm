@@ -5,6 +5,7 @@
 
 #define MAX_PATH_LEN 256
 
+// virtual fs magic numbers
 #define PROC_SUPER_MAGIC 0x9FA0
 #define SYSFS_MAGIC 0x62656572
 #define TMPFS_MAGIC 0x01021994
