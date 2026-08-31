@@ -37,8 +37,7 @@ struct {
 // block blacklisted processes
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
-  // honestly way too many for the bl, but it's just 200KB, acceptable for a
-  // prototype
+  // honestly way too many for the bl, but 200KB is acceptable for now
   __uint(max_entries, 10240);
   __uint(key_size, sizeof(u32));
   __uint(value_size, sizeof(u8));

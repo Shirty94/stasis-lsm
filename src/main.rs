@@ -1,30 +1,18 @@
-mod bpf {
-    include!("bpf/stasis_lsm.skel.rs");
-}
-use bpf::*;
+mod bpf;
+mod process;
+mod suspicion;
+
+use bpf::FileOpenSample;
 
 use libbpf_rs::{
     MapCore, OpenObject,
     skel::{OpenSkel, Skel, SkelBuilder},
 };
-use plain::Plain;
 use std::mem::MaybeUninit;
 
-// mirroring the C-struct
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct FileOpenSample {
-    pid: u32,
-    flags: u32,
-    timestamp: u64,
-    path: [u8; 256],
-}
-
-unsafe impl Plain for FileOpenSample {}
-
 fn main() -> anyhow::Result<()> {
-    // extensible vector of ignored paths
-    let mut _ignored_paths: Vec<&str> = vec![
+    // vector of ignored paths
+    let ignored_paths: Vec<&str> = vec![
         "/tmp",
         "/dev",
         "/var/cache",
@@ -32,28 +20,24 @@ fn main() -> anyhow::Result<()> {
         "/mnt/c", // ignore WSL stuff for now
     ];
 
-    let skel_builder = StasisLsmSkelBuilder::default();
-
+    // Initialize eBPF
+    let skel_builder = bpf::skeleton::StasisLsmSkelBuilder::default();
     let mut open_obj = MaybeUninit::<OpenObject>::uninit();
     let open_skel = skel_builder.open(&mut open_obj)?;
-
     let mut skel = open_skel.load()?;
     skel.attach()?;
 
+    // Populate BPF map with ignored prefixes
     let ignored_prefixes_map = &skel.maps.ignored_prefixes;
-
-    for (i, path_pfx) in _ignored_paths.iter().enumerate() {
+    for (i, path_pfx) in ignored_paths.iter().enumerate() {
         let mut value = [0u8; 256];
         value[..path_pfx.len()].copy_from_slice(path_pfx.as_bytes());
-
-        // array maps use a 32-bit integer as the key/index
         let key = (i as u32).to_ne_bytes();
-
         ignored_prefixes_map.update(&key, &value, libbpf_rs::MapFlags::ANY)?;
     }
 
+    // Set up RingBuffer
     let rb_map = &skel.maps.event_rb;
-
     let mut rb_builder = libbpf_rs::RingBufferBuilder::new();
 
     rb_builder.add(rb_map, |data| {
