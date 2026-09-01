@@ -3,6 +3,7 @@ mod process;
 mod suspicion;
 
 use bpf::FileOpenSample;
+use process::ProcessTracker;
 
 use libbpf_rs::{
     MapCore, OpenObject,
@@ -93,6 +94,8 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let process_tracker = ProcessTracker::new();
+
     let analysis_semaphore = Arc::new(Semaphore::new(MAX_TASKS));
 
     println!("Stasis LSM engine started. Listening for events...");
@@ -103,14 +106,19 @@ async fn main() -> anyhow::Result<()> {
         // one of the active tasks finishes.
         let permit = analysis_semaphore.clone().acquire_owned().await?;
 
+        let tracker = process_tracker.clone();
+
         tokio::spawn(async move {
             // move the permit inside the task.
             let _permit = permit;
 
+            let pid = sample.pid;
             let path_str = sample.path_str();
+            let count = tracker.increment_open_count(pid);
+
             println!(
-                "[file_open] PID {} opened {} at {}",
-                sample.pid, path_str, sample.timestamp
+                "[file_open] PID {} opened {} at {}; total: {}",
+                sample.pid, path_str, sample.timestamp, count
             );
 
             // TODO: run heuristic checks
