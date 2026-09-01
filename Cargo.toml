@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+dashmap = "6.2.1"
 libbpf-rs = "0.27.0"
 plain = "0.2.3"
 rand = "0.10.2"
