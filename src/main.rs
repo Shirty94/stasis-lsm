@@ -8,8 +8,21 @@ use libbpf_rs::{
     MapCore, OpenObject,
     skel::{OpenSkel, Skel, SkelBuilder},
 };
-use std::mem::MaybeUninit;
-use tokio::sync::mpsc;
+use std::{mem::MaybeUninit, sync::Arc};
+use tokio::sync::{Semaphore, mpsc};
+
+/// limits CPU and I/O contention (e.g. if heuristics need to read
+/// files to check entropy). At ~1KB per task state-machine, 1000
+/// tasks consume only ~1MB of RAM.
+const MAX_TASKS: usize = 1000;
+
+/// capacity of the event queue.
+///
+/// sized to absorb massive filesystem spikes (e.g. ransomware
+/// encrypting 15,000 files/sec). 65536 events * 272 bytes per event
+/// = ~18 MB maximum memory allocation.  This guarantees we can
+/// buffer ~2 seconds of extreme activity without dropping events.
+const QUEUE_CAPACITY: usize = 65_536;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,8 +52,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // set up async channel to send events from bpf callback to tokio
-    // tx = producer (transmitter), rx = consumer (receiver)
-    let (tx, mut rx) = mpsc::unbounded_channel::<FileOpenSample>();
+    let (tx, mut rx) = mpsc::channel::<FileOpenSample>(QUEUE_CAPACITY);
 
     // set up RingBuffer
     let rb_map = &skel.maps.event_rb;
@@ -56,9 +68,15 @@ async fn main() -> anyhow::Result<()> {
         let sample: FileOpenSample =
             *plain::from_bytes(data).expect("Failed to parse FileOpenSample");
 
-        // forward event to the async processor
-        if tx.send(sample).is_err() {
-            return -1; // channel closed, stop receiving
+        if let Err(e) = tx.try_send(sample) {
+            match e {
+                mpsc::error::TrySendError::Full(_) => {
+                    eprintln!("[WARN] Event queue full! Dropping event to prevent OOM.");
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    return -1; // channel closed, stop polling ring buffer
+                }
+            }
         }
 
         0 // success
@@ -75,13 +93,23 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let analysis_semaphore = Arc::new(Semaphore::new(MAX_TASKS));
+
     println!("Stasis LSM engine started. Listening for events...");
 
     while let Some(sample) = rx.recv().await {
+        // acquire a permit. If MAX_TASKS tasks are running, this line
+        // blocks asynchronously (without blocking the thread) until
+        // one of the active tasks finishes.
+        let permit = analysis_semaphore.clone().acquire_owned().await?;
+
         tokio::spawn(async move {
+            // move the permit inside the task.
+            let _permit = permit;
+
             let path_str = sample.path_str();
             println!(
-                "[DBG] PID {} opened {} at {}",
+                "[file_open] PID {} opened {} at {}",
                 sample.pid, path_str, sample.timestamp
             );
 
