@@ -9,8 +9,10 @@ use libbpf_rs::{
     skel::{OpenSkel, Skel, SkelBuilder},
 };
 use std::mem::MaybeUninit;
+use tokio::sync::mpsc;
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     // vector of ignored paths
     let ignored_paths: Vec<&str> = vec![
         "/tmp",
@@ -36,11 +38,15 @@ fn main() -> anyhow::Result<()> {
         ignored_prefixes_map.update(&key, &value, libbpf_rs::MapFlags::ANY)?;
     }
 
+    // set up async channel to send events from bpf callback to tokio
+    // tx = producer (transmitter), rx = consumer (receiver)
+    let (tx, mut rx) = mpsc::unbounded_channel::<FileOpenSample>();
+
     // set up RingBuffer
     let rb_map = &skel.maps.event_rb;
     let mut rb_builder = libbpf_rs::RingBufferBuilder::new();
 
-    rb_builder.add(rb_map, |data| {
+    rb_builder.add(rb_map, move |data| {
         // sanity check
         if data.len() != std::mem::size_of::<FileOpenSample>() {
             eprintln!("Unexpected data size: {}", data.len());
@@ -50,20 +56,38 @@ fn main() -> anyhow::Result<()> {
         let sample: FileOpenSample =
             *plain::from_bytes(data).expect("Failed to parse FileOpenSample");
 
-        // convert the path byte array to a Rust &str
-        let path_str = sample.path_str();
-
-        println!(
-            "PID {} opened {} (flags 0x{:x}) at {}",
-            sample.pid, path_str, sample.flags, sample.timestamp
-        );
+        // forward event to the async processor
+        if tx.send(sample).is_err() {
+            return -1; // channel closed, stop receiving
+        }
 
         0 // success
     })?;
 
     let ringbuf = rb_builder.build()?;
 
-    loop {
-        ringbuf.poll(std::time::Duration::from_millis(100))?;
+    tokio::task::spawn_blocking(move || {
+        loop {
+            if let Err(e) = ringbuf.poll(std::time::Duration::from_millis(100)) {
+                eprintln!("Error polling ring buffer: {:?}", e);
+                break;
+            }
+        }
+    });
+
+    println!("Stasis LSM engine started. Listening for events...");
+
+    while let Some(sample) = rx.recv().await {
+        tokio::spawn(async move {
+            let path_str = sample.path_str();
+            println!(
+                "[DBG] PID {} opened {} at {}",
+                sample.pid, path_str, sample.timestamp
+            );
+
+            // TODO: run heuristic checks
+        });
     }
+
+    Ok(())
 }
