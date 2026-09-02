@@ -23,7 +23,7 @@ pub struct EvaluationMetrics {
 pub fn evaluate(metrics: &EvaluationMetrics) -> Decision {
     let rate = metrics.file_open_count as f32 / metrics.duration.as_secs_f32();
 
-    // 1. Rudimentary Heuristics:
+    // rudimentary heuristics:
     if rate > 100.0 {
         // high rate of file opens
         Decision::Alert
@@ -36,7 +36,7 @@ pub fn evaluate(metrics: &EvaluationMetrics) -> Decision {
             duration: Duration::from_secs(secs),
         }
     } else {
-        // Gray zone -> keep monitoring
+        // gray zone -> keep monitoring
         Decision::KeepMonitoring
     }
 }

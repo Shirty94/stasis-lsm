@@ -88,7 +88,7 @@ impl ProcessTracker {
 
         match *state {
             ProcessState::Idle => {
-                // First event! Trigger 1-second monitoring window.
+                // first event, start monitoring window.
                 let monitor_duration = Duration::from_secs(1);
                 let deadline = Instant::now() + monitor_duration;
 
@@ -113,14 +113,14 @@ impl ProcessTracker {
             }
 
             ProcessState::EvaluationPending => {
-                // Ignore events while calculating evaluation to prevent race conditions.
+                // ignore events while calculating evaluation to prevent race conditions.
                 false
             }
 
             ProcessState::Whitelisted { expiry } => {
                 if let Some(expiry_time) = expiry {
                     if Instant::now() >= expiry_time {
-                        // Whitelist expired! Transition immediately back to monitoring.
+                        // whitelist expired, transition to monitoring
                         let monitor_duration = Duration::from_secs(1);
                         let deadline = Instant::now() + monitor_duration;
 
@@ -138,19 +138,21 @@ impl ProcessTracker {
                         context.file_open_count.store(1, Ordering::Relaxed);
                         true
                     } else {
-                        false // Bypass remaining analysis
+                        false // bypass remaining analysis
                     }
                 } else {
-                    false // Permanently whitelisted, bypass always
+                    false // permanently whitelisted, bypass always
                 }
             }
-
             ProcessState::Alerted {
                 ref mut cooldown_until,
                 ref mut alert_count,
             } => {
                 if Instant::now() >= *cooldown_until {
-                    // Alert cooldown expired! Re-alert.
+                    // alert cooldown expired, re-alert. Could maybe
+                    // switch this to a background timer, but should
+                    // be fine like this, no activity -> no need to
+                    // re-alert anyway
                     *alert_count += 1;
                     *cooldown_until = Instant::now() + Duration::from_secs(5);
                     eprintln!(
@@ -187,7 +189,7 @@ impl ProcessTracker {
             let mut state = context.state.lock().unwrap();
             match decision {
                 Decision::KeepMonitoring => {
-                    // we reset to Idle,  next file_open starts new window
+                    // we reset to Idle, next file_open starts new window
                     *state = ProcessState::Idle;
                     println!(
                         "[INFO] PID {} returned to Idle (gray zone, count: {})",
@@ -207,7 +209,10 @@ impl ProcessTracker {
                             .try_send(BpfCommand::WhitelistAdd { pid, value: 0 });
 
                         let duration_str = format!("{:?}", duration);
-                        println!("[INFO] PID {} dynamically whitelisted for {} seconds", pid, duration_str);
+                        println!(
+                            "[INFO] PID {} dynamically whitelisted for {} seconds",
+                            pid, duration_str
+                        );
 
                         let tracker = self.clone();
                         tokio::spawn(async move {
@@ -262,7 +267,7 @@ impl ProcessTracker {
             if let ProcessState::Monitoring { abort_handle, .. } = &*state {
                 abort_handle.abort();
             }
-            // Ensure we also clean up kernel space maps if the process exits
+            // ensure we also clean up kernel space maps if the process exits
             let _ = self.bpf_tx.try_send(BpfCommand::WhitelistRemove { pid });
         }
     }

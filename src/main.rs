@@ -39,13 +39,13 @@ async fn main() -> anyhow::Result<()> {
     // initialize eBPF
     let skel_builder = bpf::skeleton::StasisLsmSkelBuilder::default();
 
-    // Leak the OpenObject to make it 'static
+    // leak the OpenObject to make it static
     let open_obj = Box::leak(Box::new(MaybeUninit::<OpenObject>::uninit()));
     let open_skel = skel_builder.open(open_obj)?;
     let mut skel = open_skel.load()?;
     skel.attach()?;
 
-    // Leak the skeleton itself so references to its maps are 'static
+    // leak the skeleton itself so references to its maps are static
     let skel = Box::leak(Box::new(skel));
 
     // populate BPF map with ignored prefixes
@@ -104,8 +104,9 @@ async fn main() -> anyhow::Result<()> {
 
     let process_tracker = ProcessTracker::new(bpf_tx);
 
-    // Move the skeleton into a blocking task that runs the BPF command loop.
-    // This keeps the skeleton alive in memory while cleanly executing kernel updates.
+    // move the skeleton into a blocking task that runs the BPF
+    // command loop. This keeps the skeleton alive in memory while
+    // cleanly executing kernel updates.
     tokio::task::spawn_blocking(move || {
         let whitelist_map = &skel.maps.whitelist;
 
@@ -123,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 BpfCommand::WhitelistRemove { pid } => {
                     let key = pid.to_ne_bytes();
-                    // We try to delete the entry. If the tripwire already deleted it,
+                    // we try to delete the entry. If the tripwire already deleted it,
                     // bpf_d_path or LSM might have caused an early deletion.
                     // Thus, we safely ignore the NotFound error.
                     if let Err(e) = whitelist_map.delete(&key) {
