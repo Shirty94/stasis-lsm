@@ -3,7 +3,7 @@ mod process;
 mod suspicion;
 
 use bpf::FileOpenSample;
-use process::ProcessTracker;
+use process::{BpfCommand, ProcessTracker};
 
 use libbpf_rs::{
     MapCore, OpenObject,
@@ -38,10 +38,15 @@ async fn main() -> anyhow::Result<()> {
 
     // initialize eBPF
     let skel_builder = bpf::skeleton::StasisLsmSkelBuilder::default();
-    let mut open_obj = MaybeUninit::<OpenObject>::uninit();
-    let open_skel = skel_builder.open(&mut open_obj)?;
+
+    // Leak the OpenObject to make it 'static
+    let open_obj = Box::leak(Box::new(MaybeUninit::<OpenObject>::uninit()));
+    let open_skel = skel_builder.open(open_obj)?;
     let mut skel = open_skel.load()?;
     skel.attach()?;
+
+    // Leak the skeleton itself so references to its maps are 'static
+    let skel = Box::leak(Box::new(skel));
 
     // populate BPF map with ignored prefixes
     let ignored_prefixes_map = &skel.maps.ignored_prefixes;
@@ -51,6 +56,9 @@ async fn main() -> anyhow::Result<()> {
         let key = (i as u32).to_ne_bytes();
         ignored_prefixes_map.update(&key, &value, libbpf_rs::MapFlags::ANY)?;
     }
+
+    // set up channel for writing commands to the BPF maps
+    let (bpf_tx, mut bpf_rx) = mpsc::channel::<BpfCommand>(1024);
 
     // set up async channel to send events from bpf callback to tokio
     let (tx, mut rx) = mpsc::channel::<FileOpenSample>(QUEUE_CAPACITY);
@@ -94,7 +102,42 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let process_tracker = ProcessTracker::new();
+    let process_tracker = ProcessTracker::new(bpf_tx);
+
+    // Move the skeleton into a blocking task that runs the BPF command loop.
+    // This keeps the skeleton alive in memory while cleanly executing kernel updates.
+    tokio::task::spawn_blocking(move || {
+        let whitelist_map = &skel.maps.whitelist;
+
+        while let Some(cmd) = bpf_rx.blocking_recv() {
+            match cmd {
+                BpfCommand::WhitelistAdd { pid, value } => {
+                    let key = pid.to_ne_bytes();
+                    let val = value.to_ne_bytes();
+                    if let Err(e) = whitelist_map.update(&key, &val, libbpf_rs::MapFlags::ANY) {
+                        eprintln!(
+                            "[ERROR] Failed to update BPF whitelist for PID {}: {:?}",
+                            pid, e
+                        );
+                    }
+                }
+                BpfCommand::WhitelistRemove { pid } => {
+                    let key = pid.to_ne_bytes();
+                    // We try to delete the entry. If the tripwire already deleted it,
+                    // bpf_d_path or LSM might have caused an early deletion.
+                    // Thus, we safely ignore the NotFound error.
+                    if let Err(e) = whitelist_map.delete(&key) {
+                        if e.kind() != libbpf_rs::ErrorKind::NotFound {
+                            eprintln!(
+                                "[ERROR] Failed to delete BPF whitelist for PID {}: {:?}",
+                                pid, e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     let analysis_semaphore = Arc::new(Semaphore::new(MAX_TASKS));
 
@@ -105,23 +148,21 @@ async fn main() -> anyhow::Result<()> {
         // blocks asynchronously (without blocking the thread) until
         // one of the active tasks finishes.
         let permit = analysis_semaphore.clone().acquire_owned().await?;
-
         let tracker = process_tracker.clone();
 
         tokio::spawn(async move {
-            // move the permit inside the task.
+            // move the permit inside the task
             let _permit = permit;
 
             let pid = sample.pid;
-            let path_str = sample.path_str();
-            let count = tracker.increment_open_count(pid);
 
-            println!(
-                "[file_open] PID {} opened {} at {}; total: {}",
-                sample.pid, path_str, sample.timestamp, count
-            );
+            // returns true if we should analyze.
+            if tracker.handle_file_open(pid) {
+                let path_str = sample.path_str();
+                println!("[DBG] PID {} opened {}", pid, path_str);
 
-            // TODO: run heuristic checks
+                // TODO: run heuristic checks
+            }
         });
     }
 
