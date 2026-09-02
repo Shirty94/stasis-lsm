@@ -15,6 +15,9 @@
 #define BPF_FS_MAGIC 0xCAFE4A11
 #define ANON_INODE_FS_MAGIC 0x09041901
 
+#define PERM_WHITELIST 0xFFFFFFFF
+#define TRIPWIRE_THRESHOLD 10000 // Configurable threshold
+
 struct rb_fopen_sample {
   u32 pid;
   u32 flags;               // open flags
@@ -32,7 +35,7 @@ struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 10240);
   __uint(key_size, sizeof(u32));
-  __uint(value_size, sizeof(u8));
+  __uint(value_size, sizeof(u32));
 } whitelist SEC(".maps");
 
 // block blacklisted processes
@@ -145,9 +148,23 @@ int BPF_PROG(file_open, struct file *file) {
   struct rb_fopen_sample *sample;
   u32 pid = bpf_get_current_pid_tgid() >> 32;
 
-  // whitelist / blacklist checks
-  if (bpf_map_lookup_elem(&whitelist, &pid))
-    return 0;
+  u32 *whitelist_val = bpf_map_lookup_elem(&whitelist, &pid);
+  if (whitelist_val) {
+    if (*whitelist_val == PERM_WHITELIST) {
+      return 0; // Permanent whitelist: bypass completely
+    }
+
+    if (*whitelist_val < TRIPWIRE_THRESHOLD) {
+      // Safe atomic increment in the kernel
+      __sync_fetch_and_add(whitelist_val, 1);
+      return 0; // Quietly allow
+    } else {
+      // Tripwire triggered! Evict from map so userspace sees subsequent events
+      bpf_map_delete_elem(&whitelist, &pid);
+
+      // Let this specific event fall through to notify userspace
+    }
+  }
 
   if (bpf_map_lookup_elem(&blacklist, &pid))
     return -1;
