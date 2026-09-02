@@ -19,8 +19,8 @@ pub enum ProcessState {
     /// We are actively profiling this process. Holds the handle to the background
     /// timer task so we can abort it if the process dies or is blacklisted.
     Monitoring {
-        abort_handle: AbortHandle,
-        deadline: Instant,
+        _abort_handle: AbortHandle,
+        _deadline: Instant,
     },
 
     /// The monitoring window finished, and we are currently computing the suspicion
@@ -99,8 +99,8 @@ impl ProcessTracker {
                 });
 
                 *state = ProcessState::Monitoring {
-                    abort_handle: join_handle.abort_handle(),
-                    deadline,
+                    _abort_handle: join_handle.abort_handle(),
+                    _deadline: deadline,
                 };
 
                 context.file_open_count.store(1, Ordering::Relaxed);
@@ -131,8 +131,8 @@ impl ProcessTracker {
                         });
 
                         *state = ProcessState::Monitoring {
-                            abort_handle: join_handle.abort_handle(),
-                            deadline,
+                            _abort_handle: join_handle.abort_handle(),
+                            _deadline: deadline,
                         };
 
                         context.file_open_count.store(1, Ordering::Relaxed);
@@ -261,10 +261,10 @@ impl ProcessTracker {
     }
 
     /// Clean up process state when a process terminates
-    pub fn remove_process(&self, pid: u32) {
+    pub fn _remove_process(&self, pid: u32) {
         if let Some((_, context)) = self.processes.remove(&pid) {
             let state = context.state.lock().unwrap();
-            if let ProcessState::Monitoring { abort_handle, .. } = &*state {
+            if let ProcessState::Monitoring { _abort_handle: abort_handle, .. } = &*state {
                 abort_handle.abort();
             }
             // ensure we also clean up kernel space maps if the process exits

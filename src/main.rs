@@ -161,8 +161,6 @@ async fn main() -> anyhow::Result<()> {
             if tracker.handle_file_open(pid) {
                 let path_str = sample.path_str();
                 println!("[DBG] PID {} opened {}", pid, path_str);
-
-                // TODO: run heuristic checks
             }
         });
     }
