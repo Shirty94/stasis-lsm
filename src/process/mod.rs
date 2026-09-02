@@ -1,9 +1,48 @@
+use crate::suspicion::{self, Decision, EvaluationMetrics};
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::{sync::mpsc, task::AbortHandle};
 
-pub struct ProcessState {
+#[derive(Debug)]
+pub enum BpfCommand {
+    WhitelistAdd { pid: u32, value: u32 },
+    WhitelistRemove { pid: u32 },
+}
+
+#[derive(Debug)]
+pub enum ProcessState {
+    /// Process is not currently being tracked or has had its monitoring window expire.
+    Idle,
+
+    /// We are actively profiling this process. Holds the handle to the background
+    /// timer task so we can abort it if the process dies or is blacklisted.
+    Monitoring {
+        abort_handle: AbortHandle,
+        deadline: Instant,
+    },
+
+    /// The monitoring window finished, and we are currently computing the suspicion
+    /// score. New events are ignored until evaluation is complete to prevent race conditions.
+    EvaluationPending,
+
+    /// The process is trusted.
+    /// - `Some(expiry)`: Temporarily whitelisted (eBPF counter is active).
+    /// - `None`: Permanently whitelisted (eBPF is bypassing completely).
+    Whitelisted { expiry: Option<Instant> },
+
+    /// The process triggered an alert. It will remain in this state until explicit
+    /// administrator intervention. We track the next time we should re-alert to prevent flood.
+    Alerted {
+        cooldown_until: Instant,
+        alert_count: u32,
+    },
+}
+
+pub struct ProcessContext {
     pub _pid: u32,
+    pub state: Mutex<ProcessState>,
     // AtomicU32 for safe async incrementing
     pub file_open_count: AtomicU32,
     // future metrics:
@@ -11,10 +50,11 @@ pub struct ProcessState {
     // pub unique_directories: DashSet<PathBuf>,
 }
 
-impl ProcessState {
+impl ProcessContext {
     pub fn new(_pid: u32) -> Self {
         Self {
             _pid,
+            state: Mutex::new(ProcessState::Idle),
             file_open_count: AtomicU32::new(0),
         }
     }
