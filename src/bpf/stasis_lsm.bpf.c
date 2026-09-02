@@ -18,6 +18,8 @@
 #define PERM_WHITELIST 0xFFFFFFFF
 #define TRIPWIRE_THRESHOLD 10000 // Configurable threshold
 
+#define RINGBUF_SIZE 18 * 1024 * 1024 // 18 MB, matching mpsc queue
+
 struct rb_fopen_sample {
   u32 pid;
   u32 flags;               // open flags
@@ -27,7 +29,7 @@ struct rb_fopen_sample {
 
 struct {
   __uint(type, BPF_MAP_TYPE_RINGBUF); // type of the bpf map
-  __uint(max_entries, 256 * 1024);    // size in bytes
+  __uint(max_entries, RINGBUF_SIZE);  // size in bytes
 } event_rb SEC(".maps");
 
 // ignore whitelisted processes entirely
@@ -151,18 +153,16 @@ int BPF_PROG(file_open, struct file *file) {
   u32 *whitelist_val = bpf_map_lookup_elem(&whitelist, &pid);
   if (whitelist_val) {
     if (*whitelist_val == PERM_WHITELIST) {
-      return 0; // Permanent whitelist: bypass completely
+      return 0; // permanent whitelist: bypass completely
     }
 
     if (*whitelist_val < TRIPWIRE_THRESHOLD) {
-      // Safe atomic increment in the kernel
+      // safe atomic increment in the kernel
       __sync_fetch_and_add(whitelist_val, 1);
-      return 0; // Quietly allow
+      return 0; // quietly allow
     } else {
-      // Tripwire triggered! Evict from map so userspace sees subsequent events
+      // tripwire triggered -> remove from dynamic whitelist
       bpf_map_delete_elem(&whitelist, &pid);
-
-      // Let this specific event fall through to notify userspace
     }
   }
 
