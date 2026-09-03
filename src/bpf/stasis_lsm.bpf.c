@@ -3,8 +3,6 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
-#define MAX_PATH_LEN 256
-
 // virtual fs magic numbers
 #define PROC_SUPER_MAGIC 0x9FA0
 #define SYSFS_MAGIC 0x62656572
@@ -15,10 +13,21 @@
 #define BPF_FS_MAGIC 0xCAFE4A11
 #define ANON_INODE_FS_MAGIC 0x09041901
 
-#define PERM_WHITELIST 0xFFFFFFFF
-#define TRIPWIRE_THRESHOLD 10000 // Configurable threshold
+#ifndef MAX_PATH_LEN
+#define MAX_PATH_LEN 256
+#endif
 
+#ifndef PERM_WHITELIST
+#define PERM_WHITELIST 0xFFFFFFFF
+#endif
+
+#ifndef TRIPWIRE_THRESHOLD
+#define TRIPWIRE_THRESHOLD 10000 // Configurable threshold
+#endif
+
+#ifndef RINGBUF_SIZE
 #define RINGBUF_SIZE 18 * 1024 * 1024 // 18 MB, matching mpsc queue
+#endif
 
 struct rb_fopen_sample {
   u32 pid;
