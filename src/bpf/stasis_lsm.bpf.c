@@ -18,22 +18,46 @@
 #endif
 
 #ifndef PERM_WHITELIST
+// UINT32_MAX -> value for permanently whitelisted processes
 #define PERM_WHITELIST 0xFFFFFFFF
 #endif
 
 #ifndef TRIPWIRE_THRESHOLD
-#define TRIPWIRE_THRESHOLD 10000 // Configurable threshold
+// configurable threshold for ignoring dynamic whitelist
+#define TRIPWIRE_THRESHOLD 10000
 #endif
 
 #ifndef RINGBUF_SIZE
-#define RINGBUF_SIZE 18 * 1024 * 1024 // 18 MB, matching mpsc queue
+// 18 MB, matching mpsc queue
+#define RINGBUF_SIZE 18 * 1024 * 1024
 #endif
 
-struct rb_fopen_sample {
-  u32 pid;
+// Event types sent to userspace
+enum event_type {
+  EVENT_FILE_OPEN = 0,
+  EVENT_PROCESS_EXEC = 1,
+  EVENT_PROCESS_EXIT = 2,
+};
+
+struct fopen_sample {
   u32 flags;               // open flags
-  u64 timestamp;           // bpf_ktime_get_ns()
   char path[MAX_PATH_LEN]; // full path
+};
+
+struct pexec_sample {
+  char path[MAX_PATH_LEN]; // binary path
+};
+
+union sample_data {
+  struct fopen_sample fopen_data;
+  struct pexec_sample pexec_data;
+};
+
+struct event_sample {
+  u32 pid;
+  u32 event_type; // enum event_type
+  u64 timestamp;
+  union sample_data data;
 };
 
 struct {
@@ -156,7 +180,7 @@ static bool should_ignore_path(const char *path) {
 
 SEC("lsm.s/file_open")
 int BPF_PROG(file_open, struct file *file) {
-  struct rb_fopen_sample *sample;
+  struct event_sample *e_sample;
   u32 pid = bpf_get_current_pid_tgid() >> 32;
 
   u32 *whitelist_val = bpf_map_lookup_elem(&whitelist, &pid);
@@ -200,17 +224,25 @@ int BPF_PROG(file_open, struct file *file) {
   bpf_printk("[DBG] file_open: fpath=%s\n", fpath_buf);
 
   // reserve space in ring buffer
-  sample = bpf_ringbuf_reserve(&event_rb, sizeof(struct rb_fopen_sample), 0);
-  if (!sample) {
+  e_sample = bpf_ringbuf_reserve(&event_rb, sizeof(struct event_sample), 0);
+  if (!e_sample) {
     return 0;
   }
 
-  sample->pid = pid;
-  sample->flags = file->f_flags;
-  sample->timestamp = bpf_ktime_get_ns();
-  bpf_probe_read_str(sample->path, sizeof(sample->path), fpath_buf);
+  e_sample->pid = pid;
+  e_sample->timestamp = bpf_ktime_get_ns();
+  e_sample->event_type = EVENT_FILE_OPEN;
 
-  bpf_ringbuf_submit(sample, 0);
+  // Clear union to prevent kernel data leaks
+  __builtin_memset(&e_sample->data, 0, sizeof(e_sample->data));
+
+  // Access the union directly to avoid uninitialized pointer bugs
+  e_sample->data.fopen_data.flags = file->f_flags;
+  bpf_probe_read_str(e_sample->data.fopen_data.path,
+                     sizeof(e_sample->data.fopen_data.path),
+                     fpath_buf);
+
+  bpf_ringbuf_submit(e_sample, 0);
 
   return 0;
 }

@@ -2,7 +2,7 @@ mod bpf;
 mod process;
 mod suspicion;
 
-use bpf::FileOpenSample;
+use bpf::EventSample;
 use process::{BpfCommand, ProcessTracker};
 
 use libbpf_rs::{
@@ -61,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
     let (bpf_tx, mut bpf_rx) = mpsc::channel::<BpfCommand>(1024);
 
     // set up async channel to send events from bpf callback to tokio
-    let (tx, mut rx) = mpsc::channel::<FileOpenSample>(QUEUE_CAPACITY);
+    let (tx, mut rx) = mpsc::channel::<EventSample>(QUEUE_CAPACITY);
 
     // set up RingBuffer
     let rb_map = &skel.maps.event_rb;
@@ -69,13 +69,16 @@ async fn main() -> anyhow::Result<()> {
 
     rb_builder.add(rb_map, move |data| {
         // sanity check
-        if data.len() != std::mem::size_of::<FileOpenSample>() {
-            eprintln!("Unexpected data size: {}", data.len());
+        if data.len() != std::mem::size_of::<EventSample>() {
+            eprintln!(
+                "Unexpected data size: {} (expected {})",
+                data.len(),
+                std::mem::size_of::<EventSample>()
+            );
             return -1;
         }
 
-        let sample: FileOpenSample =
-            *plain::from_bytes(data).expect("Failed to parse FileOpenSample");
+        let sample: EventSample = *plain::from_bytes(data).expect("Failed to parse FileOpenSample");
 
         if let Err(e) = tx.try_send(sample) {
             match e {
@@ -140,29 +143,34 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // maximum number of parallel tasks for event handling
     let analysis_semaphore = Arc::new(Semaphore::new(MAX_TASKS));
 
     println!("Stasis LSM engine started. Listening for events...");
 
     while let Some(sample) = rx.recv().await {
-        // acquire a permit. If MAX_TASKS tasks are running, this line
-        // blocks asynchronously (without blocking the thread) until
-        // one of the active tasks finishes.
-        let permit = analysis_semaphore.clone().acquire_owned().await?;
-        let tracker = process_tracker.clone();
+        match sample.event_type {
+            0 => {
+                // EVENT_FILE_OPEN
+                let permit = analysis_semaphore.clone().acquire_owned().await?;
+                let tracker = process_tracker.clone();
 
-        tokio::spawn(async move {
-            // move the permit inside the task
-            let _permit = permit;
+                tokio::spawn(async move {
+                    // move the permit inside the task
+                    let _permit = permit;
 
-            let pid = sample.pid;
+                    let pid = sample.pid;
 
-            // returns true if we should analyze.
-            if tracker.handle_file_open(pid) {
-                let path_str = sample.path_str();
-                println!("[DBG] PID {} opened {}", pid, path_str);
+                    // returns true if we should analyze.
+                    if tracker.handle_file_open(pid) {
+                        let path_str = sample.path_str();
+                        println!("[DBG] PID {} opened {}", pid, path_str);
+                    }
+                });
             }
-        });
+            _ => {
+            }
+        }
     }
 
     Ok(())
