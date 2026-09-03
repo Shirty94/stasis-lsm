@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::{sync::mpsc, task::AbortHandle};
 
+const PERM_WHITELIST_VAL: u32 = 0xFFFFFFFF;
+
 #[derive(Debug)]
 pub enum BpfCommand {
     WhitelistAdd { pid: u32, value: u32 },
@@ -260,8 +262,8 @@ impl ProcessTracker {
         }
     }
 
-    /// Clean up process state when a process terminates
-    pub fn _remove_process(&self, pid: u32) {
+    /// Clean up userspace process tracking and abort timers when a PID exits or is replaced
+    pub fn handle_process_exit(&self, pid: u32) {
         if let Some((_, context)) = self.processes.remove(&pid) {
             let state = context.state.lock().unwrap();
             if let ProcessState::Monitoring {
@@ -271,8 +273,71 @@ impl ProcessTracker {
             {
                 abort_handle.abort();
             }
-            // ensure we also clean up kernel space maps if the process exits
+            // ensure BPF map entries are removed
             let _ = self.bpf_tx.try_send(BpfCommand::WhitelistRemove { pid });
+            println!("[INFO] PID {} exited. Cleaned up tracking context.", pid);
         }
+    }
+
+    /// Handles process execution. First cleans up stale structures for the recycled PID,
+    /// then determines if the program qualifies for a permanent, bypass-all whitelist.
+    pub fn handle_process_exec(&self, pid: u32, path: String) {
+        // Clean up any recycled PID tracking
+        self.handle_process_exit(pid);
+
+        // perform static whitelisting checks
+        if self.is_permanently_whitelisted(&path) {
+            let context = Arc::new(ProcessContext::new(pid));
+            {
+                let mut state = context.state.lock().unwrap();
+                *state = ProcessState::Whitelisted { expiry: None };
+            }
+            self.processes.insert(pid, context);
+
+            // BPF map bypass (0xFFFFFFFF triggers the permanent path)
+            let _ = self.bpf_tx.try_send(BpfCommand::WhitelistAdd {
+                pid,
+                value: PERM_WHITELIST_VAL,
+            });
+
+            println!(
+                "[INFO] PID {} ({}) matched permanent whitelist. Configured bypass.",
+                pid, path
+            );
+        } else {
+            println!("[INFO] PID {} ({}) exec'd. Initializing tracking.", pid, path);
+        }
+    }
+
+    /// Check if a binary path is trusted and should never be analyzed
+    fn is_permanently_whitelisted(&self, path: &str) -> bool {
+        // TODO: actually check the permanent-whitelist
+        path.starts_with("/usr/bin/")
+            || path.starts_with("/bin/")
+            || path.starts_with("/usr/sbin/")
+            || path.ends_with("/cargo")
+            || path.ends_with("/rustc")
+    }
+
+    /// Permanently whitelists a PID in both the userspace tracker and the eBPF map.
+    /// This prevents recycled PIDs or early startup events from overwriting trusted states.
+    pub fn whitelist_pid_permanently(&self, pid: u32, name: &str) {
+        let context = Arc::new(ProcessContext::new(pid));
+        {
+            let mut state = context.state.lock().unwrap();
+            *state = ProcessState::Whitelisted { expiry: None };
+        }
+        self.processes.insert(pid, context);
+
+        // directly inject permanent whitelist status to the kernel (value = 0xFFFFFFFF)
+        let _ = self.bpf_tx.try_send(BpfCommand::WhitelistAdd {
+            pid,
+            value: PERM_WHITELIST_VAL,
+        });
+
+        println!(
+            "[INFO] PID {} ({}) marked permanently whitelisted in userspace & kernel.",
+            pid, name
+        );
     }
 }

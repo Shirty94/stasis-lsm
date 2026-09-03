@@ -25,6 +25,22 @@ const MAX_TASKS: usize = 1000;
 /// buffer ~2 seconds of extreme activity without dropping events.
 const QUEUE_CAPACITY: usize = 65_536;
 
+/// Reads `/proc/self/status` to determine the global (host) PID.
+/// This prevents mismatches when running inside PID namespaces (containers/sandboxes/WSL).
+fn get_global_pid() -> u32 {
+    let status_content = std::fs::read_to_string("/proc/self/status").ok();
+
+    status_content
+        .and_then(|status| {
+            status.lines().find(|line| line.starts_with("NSpid:")).and_then(|line| {
+                line.split_whitespace()
+                    .last()
+                    .and_then(|pid_str| pid_str.parse::<u32>().ok())
+            })
+        })
+        .unwrap_or_else(|| std::process::id())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // vector of ignored paths
@@ -48,6 +64,16 @@ async fn main() -> anyhow::Result<()> {
     // leak the skeleton itself so references to its maps are static
     let skel = Box::leak(Box::new(skel));
 
+    // set up channel for writing commands to the BPF maps
+    let (bpf_tx, mut bpf_rx) = mpsc::channel::<BpfCommand>(1024);
+
+    // set up process tracker
+    let process_tracker = ProcessTracker::new(bpf_tx);
+
+    // add our own PID to the whitelist
+    let self_pid = get_global_pid();
+    process_tracker.whitelist_pid_permanently(self_pid, "stasis_engine");
+
     // populate BPF map with ignored prefixes
     let ignored_prefixes_map = &skel.maps.ignored_prefixes;
     for (i, path_pfx) in ignored_paths.iter().enumerate() {
@@ -56,9 +82,6 @@ async fn main() -> anyhow::Result<()> {
         let key = (i as u32).to_ne_bytes();
         ignored_prefixes_map.update(&key, &value, libbpf_rs::MapFlags::ANY)?;
     }
-
-    // set up channel for writing commands to the BPF maps
-    let (bpf_tx, mut bpf_rx) = mpsc::channel::<BpfCommand>(1024);
 
     // set up async channel to send events from bpf callback to tokio
     let (tx, mut rx) = mpsc::channel::<EventSample>(QUEUE_CAPACITY);
@@ -104,8 +127,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
-
-    let process_tracker = ProcessTracker::new(bpf_tx);
 
     // move the skeleton into a blocking task that runs the BPF
     // command loop. This keeps the skeleton alive in memory while
@@ -156,19 +177,31 @@ async fn main() -> anyhow::Result<()> {
                 let tracker = process_tracker.clone();
 
                 tokio::spawn(async move {
-                    // move the permit inside the task
                     let _permit = permit;
-
                     let pid = sample.pid;
 
-                    // returns true if we should analyze.
                     if tracker.handle_file_open(pid) {
                         let path_str = sample.path_str();
-                        println!("[DBG] PID {} opened {}", pid, path_str);
+                        let comm_str = sample.comm_str();
+
+                        println!(
+                            "[INFO] PID {} ({}) opened {}",
+                            pid, comm_str, path_str
+                        );
                     }
                 });
             }
+            1 => {
+                // EVENT_PROCESS_EXEC
+                let path = sample.path_str().to_string();
+                process_tracker.handle_process_exec(sample.pid, path);
+            }
+            2 => {
+                // EVENT_PROCESS_EXIT
+                process_tracker.handle_process_exit(sample.pid);
+            }
             _ => {
+                eprintln!("[WARN] Received unknown event type: {}", sample.event_type);
             }
         }
     }

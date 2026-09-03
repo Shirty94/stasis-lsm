@@ -30,10 +30,10 @@ pub struct EventSample {
     pub pid: u32,
     pub event_type: u32,
     pub timestamp: u64,
+    pub comm: [u8; 16],
     pub data: SampleData,
 }
 
-// Safely mark everything as Plain
 unsafe impl Plain for FOpenSample {}
 unsafe impl Plain for PExecsample {}
 unsafe impl Plain for SampleData {}
@@ -60,4 +60,14 @@ impl EventSample {
             .unwrap_or(path_bytes.len());
         std::str::from_utf8(&path_bytes[..len]).unwrap_or("<invalid UTF-8>")
     }
+
+    /// Safe helper to extract the executable name
+    pub fn comm_str(&self) -> &str {
+        let len = self.comm
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.comm.len());
+        std::str::from_utf8(&self.comm[..len]).unwrap_or("<invalid UTF-8>")
+    }
+
 }

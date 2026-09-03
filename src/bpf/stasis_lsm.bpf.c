@@ -12,6 +12,7 @@
 #define CGROUP2_SUPER_MAGIC 0x63677270
 #define BPF_FS_MAGIC 0xCAFE4A11
 #define ANON_INODE_FS_MAGIC 0x09041901
+#define DEBUGFS_MAGIC 0x64626720
 
 #ifndef MAX_PATH_LEN
 #define MAX_PATH_LEN 256
@@ -57,6 +58,7 @@ struct event_sample {
   u32 pid;
   u32 event_type; // enum event_type
   u64 timestamp;
+  char comm[16];
   union sample_data data;
 };
 
@@ -118,6 +120,7 @@ static inline bool is_virtual_fs(struct file *file) {
   case CGROUP2_SUPER_MAGIC:
   case BPF_FS_MAGIC:
   case ANON_INODE_FS_MAGIC:
+  case DEBUGFS_MAGIC:
     return true;
   default:
     return false;
@@ -233,6 +236,9 @@ int BPF_PROG(file_open, struct file *file) {
   e_sample->timestamp = bpf_ktime_get_ns();
   e_sample->event_type = EVENT_FILE_OPEN;
 
+  // get command name
+  bpf_get_current_comm(&e_sample->comm, sizeof(e_sample->comm));
+
   // Clear union to prevent kernel data leaks
   __builtin_memset(&e_sample->data, 0, sizeof(e_sample->data));
 
@@ -244,6 +250,79 @@ int BPF_PROG(file_open, struct file *file) {
 
   bpf_ringbuf_submit(e_sample, 0);
 
+  return 0;
+}
+
+SEC("lsm.s/bprm_creds_for_exec")
+int BPF_PROG(bprm_creds_for_exec, struct linux_binprm *bprm) {
+  u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+  // Immediately evict stale rules for this recycled PID in-kernel
+  bpf_map_delete_elem(&whitelist, &pid);
+  bpf_map_delete_elem(&blacklist, &pid);
+
+  // Directly dereference. Since this is a sleepable LSM hook, the verifier
+  // permits direct access and preserves the "trusted pointer" type.
+  struct file *file = bprm->file;
+  if (!file) {
+    return 0;
+  }
+
+  char fpath_buf[MAX_PATH_LEN] = {0};
+  long ret = bpf_d_path(&file->f_path, fpath_buf, sizeof(fpath_buf));
+  if (ret < 0) {
+    return 0;
+  }
+
+  struct event_sample *e_sample = bpf_ringbuf_reserve(&event_rb, sizeof(struct event_sample), 0);
+  if (!e_sample) {
+    return 0;
+  }
+
+  e_sample->pid = pid;
+  e_sample->timestamp = bpf_ktime_get_ns();
+  e_sample->event_type = EVENT_PROCESS_EXEC;
+
+  bpf_get_current_comm(&e_sample->comm, sizeof(e_sample->comm));
+
+  __builtin_memset(&e_sample->data, 0, sizeof(e_sample->data));
+  bpf_probe_read_str(e_sample->data.pexec_data.path,
+                     sizeof(e_sample->data.pexec_data.path),
+                     fpath_buf);
+
+  bpf_ringbuf_submit(e_sample, 0);
+  return 0;
+}
+
+SEC("tracepoint/sched/sched_process_exit")
+int handle_exit(void *ctx) {
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  u32 tgid = pid_tgid >> 32;
+  u32 tid = (u32)pid_tgid;
+
+  // Only handle main thread exit to avoid multi-thread event spam
+  if (tgid != tid) {
+    return 0;
+  }
+
+  // Immediately evict stale rules in-kernel
+  bpf_map_delete_elem(&whitelist, &tgid);
+  bpf_map_delete_elem(&blacklist, &tgid);
+
+  struct event_sample *e_sample = bpf_ringbuf_reserve(&event_rb, sizeof(struct event_sample), 0);
+  if (!e_sample) {
+    return 0;
+  }
+
+  e_sample->pid = tgid;
+  e_sample->timestamp = bpf_ktime_get_ns();
+  e_sample->event_type = EVENT_PROCESS_EXIT;
+
+  bpf_get_current_comm(&e_sample->comm, sizeof(e_sample->comm));
+
+  __builtin_memset(&e_sample->data, 0, sizeof(e_sample->data));
+
+  bpf_ringbuf_submit(e_sample, 0);
   return 0;
 }
 
