@@ -264,7 +264,11 @@ impl ProcessTracker {
     pub fn _remove_process(&self, pid: u32) {
         if let Some((_, context)) = self.processes.remove(&pid) {
             let state = context.state.lock().unwrap();
-            if let ProcessState::Monitoring { _abort_handle: abort_handle, .. } = &*state {
+            if let ProcessState::Monitoring {
+                _abort_handle: abort_handle,
+                ..
+            } = &*state
+            {
                 abort_handle.abort();
             }
             // ensure we also clean up kernel space maps if the process exits
