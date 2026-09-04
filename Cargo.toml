@@ -5,10 +5,12 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+crossterm = "0.29.0"
 dashmap = "6.2.1"
 libbpf-rs = "0.27.0"
 plain = "0.2.3"
 rand = "0.10.2"
+ratatui = "0.30.2"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [build-dependencies]
