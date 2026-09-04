@@ -1,9 +1,11 @@
 mod bpf;
 mod process;
 mod suspicion;
+mod tui;
 
 use bpf::EventSample;
 use process::{BpfCommand, ProcessTracker};
+use tui::{Tui, UiEvent};
 
 use libbpf_rs::{
     MapCore, OpenObject,
@@ -32,14 +34,54 @@ fn get_global_pid() -> u32 {
 
     status_content
         .and_then(|status| {
-            status.lines().find(|line| line.starts_with("NSpid:")).and_then(|line| {
-                line.split_whitespace()
-                    .last()
-                    .and_then(|pid_str| pid_str.parse::<u32>().ok())
-            })
+            status
+                .lines()
+                .find(|line| line.starts_with("NSpid:"))
+                .and_then(|line| {
+                    line.split_whitespace()
+                        .last()
+                        .and_then(|pid_str| pid_str.parse::<u32>().ok())
+                })
         })
-        .unwrap_or_else(|| std::process::id())
+        .unwrap_or_else(std::process::id)
 }
+
+/// A thread-safe wrapper around a static libbpf map reference.
+/// BPF maps are inherently thread-safe to query/update concurrently from multiple threads
+/// as the Linux kernel manages concurrency internal to the map.
+struct SharedMap(&'static libbpf_rs::Map<'static>);
+unsafe impl Send for SharedMap {}
+unsafe impl Sync for SharedMap {}
+
+impl SharedMap {
+    pub fn update(
+        &self,
+        key: &[u8],
+        val: &[u8],
+        flags: libbpf_rs::MapFlags,
+    ) -> Result<(), libbpf_rs::Error> {
+        self.0.update(key, val, flags)
+    }
+
+    pub fn delete(&self, key: &[u8]) -> Result<(), libbpf_rs::Error> {
+        self.0.delete(key)
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = Vec<u8>> + '_ {
+        self.0.keys()
+    }
+
+    pub fn lookup(
+        &self,
+        key: &[u8],
+        flags: libbpf_rs::MapFlags,
+    ) -> Result<Option<Vec<u8>>, libbpf_rs::Error> {
+        self.0.lookup(key, flags)
+    }
+}
+
+struct SendRingBuffer<T>(T);
+unsafe impl<T> Send for SendRingBuffer<T> {}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -63,19 +105,29 @@ async fn main() -> anyhow::Result<()> {
 
     // leak the skeleton itself so references to its maps are static
     let skel = Box::leak(Box::new(skel));
+    let whitelist_map: &'static libbpf_rs::Map<'static> = &skel.maps.whitelist;
+    let ignored_prefixes_map: &'static libbpf_rs::Map<'static> = &skel.maps.ignored_prefixes;
+    let rb_map: &'static libbpf_rs::Map<'static> = &skel.maps.event_rb;
 
-    // set up channel for writing commands to the BPF maps
+    // set up channel for tui, bpf map manipulation and bpf events
+    let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>(4096);
     let (bpf_tx, mut bpf_rx) = mpsc::channel::<BpfCommand>(1024);
+    let (tx, mut rx) = mpsc::channel::<EventSample>(QUEUE_CAPACITY);
 
     // set up process tracker
-    let process_tracker = ProcessTracker::new(bpf_tx);
+    let process_tracker = ProcessTracker::new(bpf_tx, ui_tx.clone());
+
+    // send initial TUI log
+    let _ = ui_tx.try_send(UiEvent::Log {
+        level: "INFO".to_string(),
+        msg: "Stasis Engine starting...".to_string(),
+    });
 
     // add our own PID to the whitelist
     let self_pid = get_global_pid();
     process_tracker.whitelist_pid_permanently(self_pid, "stasis_engine");
 
     // populate BPF map with ignored prefixes
-    let ignored_prefixes_map = &skel.maps.ignored_prefixes;
     for (i, path_pfx) in ignored_paths.iter().enumerate() {
         let mut value = [0u8; 256];
         value[..path_pfx.len()].copy_from_slice(path_pfx.as_bytes());
@@ -83,11 +135,7 @@ async fn main() -> anyhow::Result<()> {
         ignored_prefixes_map.update(&key, &value, libbpf_rs::MapFlags::ANY)?;
     }
 
-    // set up async channel to send events from bpf callback to tokio
-    let (tx, mut rx) = mpsc::channel::<EventSample>(QUEUE_CAPACITY);
-
     // set up RingBuffer
-    let rb_map = &skel.maps.event_rb;
     let mut rb_builder = libbpf_rs::RingBufferBuilder::new();
 
     rb_builder.add(rb_map, move |data| {
@@ -118,91 +166,130 @@ async fn main() -> anyhow::Result<()> {
     })?;
 
     let ringbuf = rb_builder.build()?;
+    let ringbuf = SendRingBuffer(ringbuf);
 
+    let ui_tx_rb = ui_tx.clone();
     tokio::task::spawn_blocking(move || {
+        let mut ringbuf = ringbuf;
         loop {
-            if let Err(e) = ringbuf.poll(std::time::Duration::from_millis(100)) {
-                eprintln!("Error polling ring buffer: {:?}", e);
+            if let Err(e) = ringbuf.0.poll(std::time::Duration::from_millis(100)) {
+                let _ = ui_tx_rb.try_send(UiEvent::Log {
+                    level: "ERROR".to_string(),
+                    msg: format!("Error polling ring buffer: {:?}", e),
+                });
                 break;
             }
         }
     });
 
-    // move the skeleton into a blocking task that runs the BPF
-    // command loop. This keeps the skeleton alive in memory while
-    // cleanly executing kernel updates.
+    let bpf_whitelist_map = SharedMap(whitelist_map);
+    let ui_tx_bpf = ui_tx.clone();
     tokio::task::spawn_blocking(move || {
-        let whitelist_map = &skel.maps.whitelist;
-
         while let Some(cmd) = bpf_rx.blocking_recv() {
             match cmd {
-                BpfCommand::WhitelistAdd { pid, value } => {
+                BpfCommand::WhitelistAdd { pid, comm, value } => {
                     let key = pid.to_ne_bytes();
                     let val = value.to_ne_bytes();
-                    if let Err(e) = whitelist_map.update(&key, &val, libbpf_rs::MapFlags::ANY) {
-                        eprintln!(
-                            "[ERROR] Failed to update BPF whitelist for PID {}: {:?}",
-                            pid, e
-                        );
+                    if let Err(e) = bpf_whitelist_map.update(&key, &val, libbpf_rs::MapFlags::ANY) {
+                        let _ = ui_tx_bpf.try_send(UiEvent::Log {
+                            level: "ERROR".to_string(),
+                            msg: format!("Failed to update BPF whitelist for PID {}: {:?}", pid, e),
+                        });
+                    } else {
+                        let _ = ui_tx_bpf.try_send(UiEvent::BpfWhitelistAdd { pid, comm, value });
                     }
                 }
                 BpfCommand::WhitelistRemove { pid } => {
                     let key = pid.to_ne_bytes();
-                    // we try to delete the entry. If the tripwire already deleted it,
-                    // bpf_d_path or LSM might have caused an early deletion.
-                    // Thus, we safely ignore the NotFound error.
-                    if let Err(e) = whitelist_map.delete(&key) {
+                    if let Err(e) = bpf_whitelist_map.delete(&key) {
                         if e.kind() != libbpf_rs::ErrorKind::NotFound {
-                            eprintln!(
-                                "[ERROR] Failed to delete BPF whitelist for PID {}: {:?}",
-                                pid, e
-                            );
+                            let _ = ui_tx_bpf.try_send(UiEvent::Log {
+                                level: "ERROR".to_string(),
+                                msg: format!(
+                                    "Failed to delete BPF whitelist for PID {}: {:?}",
+                                    pid, e
+                                ),
+                            });
                         }
+                    } else {
+                        let _ = ui_tx_bpf.try_send(UiEvent::BpfWhitelistRemove { pid });
                     }
                 }
             }
+        }
+    });
+
+    // ACTIVE KERNEL MAP POLLING
+    let whitelist_map_shared = SharedMap(whitelist_map);
+    let ui_tx_poll = ui_tx.clone();
+
+    tokio::spawn(async move {
+        let whitelist_map = whitelist_map_shared;
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+
+        loop {
+            interval.tick().await;
+
+            let mut keys = Vec::new();
+            for key_bytes in whitelist_map.keys() {
+                if let Ok(key_array) = key_bytes.as_slice().try_into() {
+                    let key = u32::from_ne_bytes(key_array);
+                    keys.push(key);
+                }
+            }
+
+            for pid in keys {
+                let key_bytes = pid.to_ne_bytes();
+                if let Ok(Some(val_bytes)) =
+                    whitelist_map.lookup(&key_bytes, libbpf_rs::MapFlags::ANY)
+                {
+                    if let Ok(val_array) = val_bytes.as_slice().try_into() {
+                        let value = u32::from_ne_bytes(val_array);
+                        let _ =
+                            ui_tx_poll.try_send(UiEvent::BpfWhitelistCounterUpdate { pid, value });
+                    }
+                }
+            }
+        }
+    });
+
+    std::thread::spawn(move || {
+        let tui = Tui::new(ui_rx);
+        if let Err(e) = tui.run() {
+            eprintln!("TUI run error: {:?}", e);
         }
     });
 
     // maximum number of parallel tasks for event handling
     let analysis_semaphore = Arc::new(Semaphore::new(MAX_TASKS));
 
-    println!("Stasis LSM engine started. Listening for events...");
-
     while let Some(sample) = rx.recv().await {
         match sample.event_type {
             0 => {
-                // EVENT_FILE_OPEN
-                let permit = analysis_semaphore.clone().acquire_owned().await?;
-                let tracker = process_tracker.clone();
+                // EVENT_FILE_OPEN - process state synchronously to guarantee ordering
+                let pid = sample.pid;
+                let comm_str = sample.comm_str().to_string();
 
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    let pid = sample.pid;
+                let needs_active_analysis = process_tracker.handle_file_open(pid, comm_str);
 
-                    if tracker.handle_file_open(pid) {
-                        let path_str = sample.path_str();
-                        let comm_str = sample.comm_str();
-
-                        println!(
-                            "[INFO] PID {} ({}) opened {}",
-                            pid, comm_str, path_str
-                        );
-                    }
-                });
+                if needs_active_analysis {
+                    // only spawn a task if we need to do heavy active analysis
+                    let permit = analysis_semaphore.clone().acquire_owned().await?;
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        // future heavy checks go here
+                    });
+                }
             }
             1 => {
-                // EVENT_PROCESS_EXEC
                 let path = sample.path_str().to_string();
                 process_tracker.handle_process_exec(sample.pid, path);
             }
             2 => {
-                // EVENT_PROCESS_EXIT
-                process_tracker.handle_process_exit(sample.pid);
+                let comm_str = sample.comm_str().to_string();
+                process_tracker.handle_process_exit(sample.pid, &comm_str);
             }
-            _ => {
-                eprintln!("[WARN] Received unknown event type: {}", sample.event_type);
-            }
+            _ => {}
         }
     }
 

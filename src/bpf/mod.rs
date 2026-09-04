@@ -63,11 +63,11 @@ impl EventSample {
 
     /// Safe helper to extract the executable name
     pub fn comm_str(&self) -> &str {
-        let len = self.comm
+        let len = self
+            .comm
             .iter()
             .position(|&b| b == 0)
             .unwrap_or(self.comm.len());
         std::str::from_utf8(&self.comm[..len]).unwrap_or("<invalid UTF-8>")
     }
-
 }

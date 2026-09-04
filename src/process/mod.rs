@@ -1,4 +1,5 @@
 use crate::suspicion::{self, Decision, EvaluationMetrics};
+use crate::tui::UiEvent;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,7 +10,7 @@ const PERM_WHITELIST_VAL: u32 = 0xFFFFFFFF;
 
 #[derive(Debug)]
 pub enum BpfCommand {
-    WhitelistAdd { pid: u32, value: u32 },
+    WhitelistAdd { pid: u32, comm: String, value: u32 },
     WhitelistRemove { pid: u32 },
 }
 
@@ -64,22 +65,42 @@ impl ProcessContext {
 
 #[derive(Clone)]
 pub struct ProcessTracker {
-    // sharded map to track processes
+    /// sharded map to track processes
     processes: Arc<DashMap<u32, Arc<ProcessContext>>>,
     bpf_tx: mpsc::Sender<BpfCommand>, // channel sender to write to BPF maps
+    ui_tx: mpsc::Sender<UiEvent>,     // UI transmission channel
 }
 
 impl ProcessTracker {
-    pub fn new(bpf_tx: mpsc::Sender<BpfCommand>) -> Self {
+    pub fn new(bpf_tx: mpsc::Sender<BpfCommand>, ui_tx: mpsc::Sender<UiEvent>) -> Self {
         Self {
             processes: Arc::new(DashMap::new()),
             bpf_tx,
+            ui_tx,
         }
+    }
+
+    /// Helper to send logs to the UI without blocking
+    fn ui_log(&self, level: &str, msg: String) {
+        let _ = self.ui_tx.try_send(UiEvent::Log {
+            level: level.to_string(),
+            msg,
+        });
+    }
+
+    /// Helper to update process view in TUI
+    fn update_ui_proc(&self, pid: u32, comm: &str, state: &str, count: u32) {
+        let _ = self.ui_tx.try_send(UiEvent::ProcessUpdated {
+            pid,
+            comm: comm.to_string(),
+            state: state.to_string(),
+            count,
+        });
     }
 
     /// Handles an incoming file open event.
     /// Returns `true` if we should execute active userspace checks (like file entropy).
-    pub fn handle_file_open(&self, pid: u32) -> bool {
+    pub fn handle_file_open(&self, pid: u32, comm: String) -> bool {
         let context = self
             .processes
             .entry(pid)
@@ -95,9 +116,10 @@ impl ProcessTracker {
                 let deadline = Instant::now() + monitor_duration;
 
                 let tracker = self.clone();
+                let comm_clone = comm.clone();
                 let join_handle = tokio::spawn(async move {
                     tokio::time::sleep(monitor_duration).await;
-                    tracker.evaluate(pid);
+                    tracker.evaluate(pid, &comm_clone);
                 });
 
                 *state = ProcessState::Monitoring {
@@ -106,15 +128,19 @@ impl ProcessTracker {
                 };
 
                 context.file_open_count.store(1, Ordering::Relaxed);
+                self.update_ui_proc(pid, &comm, "Monitoring", 1);
                 true
             }
 
             ProcessState::Monitoring { .. } => {
-                context.file_open_count.fetch_add(1, Ordering::Relaxed);
+                let count = context.file_open_count.fetch_add(1, Ordering::Relaxed);
+                self.update_ui_proc(pid, &comm, "Monitoring", count);
                 true
             }
 
             ProcessState::EvaluationPending => {
+                let count = context.file_open_count.load(Ordering::Relaxed);
+                self.update_ui_proc(pid, &comm, "Evaluation Pending", count);
                 // ignore events while calculating evaluation to prevent race conditions.
                 false
             }
@@ -127,9 +153,10 @@ impl ProcessTracker {
                         let deadline = Instant::now() + monitor_duration;
 
                         let tracker = self.clone();
+                        let comm_clone = comm.clone();
                         let join_handle = tokio::spawn(async move {
                             tokio::time::sleep(monitor_duration).await;
-                            tracker.evaluate(pid);
+                            tracker.evaluate(pid, &comm_clone);
                         });
 
                         *state = ProcessState::Monitoring {
@@ -138,11 +165,16 @@ impl ProcessTracker {
                         };
 
                         context.file_open_count.store(1, Ordering::Relaxed);
+                        self.update_ui_proc(pid, &comm, "Monitoring", 1);
                         true
                     } else {
+                        let count = context.file_open_count.load(Ordering::Relaxed);
+                        self.update_ui_proc(pid, &comm, "Whitelisted (Temp)", count);
                         false // bypass remaining analysis
                     }
                 } else {
+                    let count = context.file_open_count.load(Ordering::Relaxed);
+                    self.update_ui_proc(pid, &comm, "Whitelisted (Perm)", count);
                     false // permanently whitelisted, bypass always
                 }
             }
@@ -150,6 +182,7 @@ impl ProcessTracker {
                 ref mut cooldown_until,
                 ref mut alert_count,
             } => {
+                let count = context.file_open_count.load(Ordering::Relaxed);
                 if Instant::now() >= *cooldown_until {
                     // alert cooldown expired, re-alert. Could maybe
                     // switch this to a background timer, but should
@@ -157,18 +190,22 @@ impl ProcessTracker {
                     // re-alert anyway
                     *alert_count += 1;
                     *cooldown_until = Instant::now() + Duration::from_secs(5);
-                    eprintln!(
-                        "[RE-ALERT] PID {} still misbehaving! (Alert Count: {})",
-                        pid, alert_count
+                    self.ui_log(
+                        "ALERT",
+                        format!(
+                            "PID {} ({}) still misbehaving! (Alert Count: {})",
+                            pid, comm, alert_count
+                        ),
                     );
                 }
+                self.update_ui_proc(pid, &comm, "Alerted", count);
                 true
             }
         }
     }
 
     /// Run evaluation when the monitoring timer expires.
-    fn evaluate(&self, pid: u32) {
+    fn evaluate(&self, pid: u32, comm: &str) {
         let context = match self.processes.get(&pid) {
             Some(ctx) => ctx.clone(),
             None => return,
@@ -178,6 +215,7 @@ impl ProcessTracker {
 
         if let ProcessState::Monitoring { .. } = *state {
             *state = ProcessState::EvaluationPending;
+            self.update_ui_proc(pid, comm, "Evaluating", 0);
             drop(state); // drop guard during the evaluation
 
             let count = context.file_open_count.swap(0, Ordering::Relaxed);
@@ -193,10 +231,14 @@ impl ProcessTracker {
                 Decision::KeepMonitoring => {
                     // we reset to Idle, next file_open starts new window
                     *state = ProcessState::Idle;
-                    println!(
-                        "[INFO] PID {} returned to Idle (gray zone, count: {})",
-                        pid, count
+                    self.ui_log(
+                        "INFO",
+                        format!(
+                            "PID {} ({}) returned to Idle (gray zone, count: {})",
+                            pid, comm, count
+                        ),
                     );
+                    self.update_ui_proc(pid, comm, "Idle", 0);
                 }
                 Decision::WhitelistTemp { duration } => {
                     let expiry = Instant::now() + duration;
@@ -206,20 +248,26 @@ impl ProcessTracker {
 
                     // ensure the process wasn't deleted already
                     if self.processes.contains_key(&pid) {
-                        let _ = self
-                            .bpf_tx
-                            .try_send(BpfCommand::WhitelistAdd { pid, value: 0 });
+                        let _ = self.bpf_tx.try_send(BpfCommand::WhitelistAdd {
+                            pid,
+                            comm: comm.to_string(),
+                            value: 0,
+                        });
 
-                        let duration_str = format!("{:?}", duration);
-                        println!(
-                            "[INFO] PID {} dynamically whitelisted for {} seconds",
-                            pid, duration_str
+                        self.ui_log(
+                            "INFO",
+                            format!(
+                                "PID {} ({}) dynamically whitelisted for {:?}",
+                                pid, comm, duration
+                            ),
                         );
+                        self.update_ui_proc(pid, comm, "Whitelisted (Temp)", 0);
 
                         let tracker = self.clone();
+                        let comm_clone = comm.to_string();
                         tokio::spawn(async move {
                             tokio::time::sleep(duration).await;
-                            tracker.expire_whitelist(pid, expiry);
+                            tracker.expire_whitelist(pid, &comm_clone, expiry);
                         });
                     }
                 }
@@ -229,17 +277,21 @@ impl ProcessTracker {
                         cooldown_until,
                         alert_count: 1,
                     };
-                    eprintln!(
-                        "[ALERT] PID {} triggered ransomware alert! ({} opens/sec)",
-                        pid, count
+                    self.ui_log(
+                        "ALERT",
+                        format!(
+                            "PID {} ({}) triggered ransomware alert! ({} opens/sec)",
+                            pid, comm, count
+                        ),
                     );
+                    self.update_ui_proc(pid, comm, "Alerted", count);
                 }
             }
         }
     }
 
     /// Actively transitions an expired whitelist back to Idle and evicts it from kernel space.
-    fn expire_whitelist(&self, pid: u32, expected_expiry: Instant) {
+    fn expire_whitelist(&self, pid: u32, comm: &str, expected_expiry: Instant) {
         if let Some(context) = self.processes.get(&pid) {
             let mut state = context.state.lock().unwrap();
 
@@ -256,14 +308,21 @@ impl ProcessTracker {
                     // expire dynamic whitelist entry
                     let _ = self.bpf_tx.try_send(BpfCommand::WhitelistRemove { pid });
 
-                    println!("[INFO] PID {} whitelist expired. Returned to Idle.", pid);
+                    self.ui_log(
+                        "INFO",
+                        format!(
+                            "PID {} ({}) whitelist expired. Returned to Idle.",
+                            pid, comm
+                        ),
+                    );
+                    self.update_ui_proc(pid, comm, "Idle", 0);
                 }
             }
         }
     }
 
     /// Clean up userspace process tracking and abort timers when a PID exits or is replaced
-    pub fn handle_process_exit(&self, pid: u32) {
+    pub fn handle_process_exit(&self, pid: u32, comm: &str) {
         if let Some((_, context)) = self.processes.remove(&pid) {
             let state = context.state.lock().unwrap();
             if let ProcessState::Monitoring {
@@ -275,15 +334,21 @@ impl ProcessTracker {
             }
             // ensure BPF map entries are removed
             let _ = self.bpf_tx.try_send(BpfCommand::WhitelistRemove { pid });
-            println!("[INFO] PID {} exited. Cleaned up tracking context.", pid);
+            self.ui_log(
+                "INFO",
+                format!(
+                    "PID {} ({}) exited. Cleaned up tracking context.",
+                    pid, comm
+                ),
+            );
         }
     }
 
     /// Handles process execution. First cleans up stale structures for the recycled PID,
     /// then determines if the program qualifies for a permanent, bypass-all whitelist.
     pub fn handle_process_exec(&self, pid: u32, path: String) {
-        // Clean up any recycled PID tracking
-        self.handle_process_exit(pid);
+        // clean up any recycled PID tracking
+        self.handle_process_exit(pid, &path);
 
         // perform static whitelisting checks
         if self.is_permanently_whitelisted(&path) {
@@ -297,15 +362,24 @@ impl ProcessTracker {
             // BPF map bypass (0xFFFFFFFF triggers the permanent path)
             let _ = self.bpf_tx.try_send(BpfCommand::WhitelistAdd {
                 pid,
+                comm: path.clone(),
                 value: PERM_WHITELIST_VAL,
             });
 
-            println!(
-                "[INFO] PID {} ({}) matched permanent whitelist. Configured bypass.",
-                pid, path
+            self.ui_log(
+                "INFO",
+                format!(
+                    "PID {} ({}) matched permanent whitelist. Configured bypass.",
+                    pid, path
+                ),
             );
+            self.update_ui_proc(pid, &path, "Whitelisted (Perm)", 0);
         } else {
-            println!("[INFO] PID {} ({}) exec'd. Initializing tracking.", pid, path);
+            self.ui_log(
+                "INFO",
+                format!("PID {} ({}) exec'd. Initializing tracking.", pid, path),
+            );
+            self.update_ui_proc(pid, &path, "Idle", 0);
         }
     }
 
@@ -332,12 +406,16 @@ impl ProcessTracker {
         // directly inject permanent whitelist status to the kernel (value = 0xFFFFFFFF)
         let _ = self.bpf_tx.try_send(BpfCommand::WhitelistAdd {
             pid,
+            comm: name.to_string(),
             value: PERM_WHITELIST_VAL,
         });
-
-        println!(
-            "[INFO] PID {} ({}) marked permanently whitelisted in userspace & kernel.",
-            pid, name
+        self.ui_log(
+            "INFO",
+            format!(
+                "PID {} ({}) marked permanently whitelisted in userspace & kernel.",
+                pid, name
+            ),
         );
+        self.update_ui_proc(pid, name, "Idle", 0);
     }
 }
