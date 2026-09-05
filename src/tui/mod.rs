@@ -48,6 +48,13 @@ pub enum UiEvent {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivePanel {
+    Processes,
+    BpfWhitelist,
+    Logs,
+}
+
 struct BpfWhitelistState {
     comm: String,
     value: u32,
@@ -65,6 +72,7 @@ struct TuiState {
     bpf_whitelist: HashMap<u32, BpfWhitelistState>,
     bpf_blacklist: HashMap<u32, u8>,
     logs: VecDeque<(String, String)>, // (level, message)
+    active_panel: ActivePanel,
 }
 
 impl TuiState {
@@ -74,6 +82,7 @@ impl TuiState {
             bpf_whitelist: HashMap::new(),
             bpf_blacklist: HashMap::new(),
             logs: VecDeque::with_capacity(MAX_LOGS),
+            active_panel: ActivePanel::Processes,
         }
     }
 
@@ -82,6 +91,14 @@ impl TuiState {
             self.logs.pop_front();
         }
         self.logs.push_back((level, msg));
+    }
+
+    fn next_panel(&mut self) {
+        self.active_panel = match self.active_panel {
+            ActivePanel::Processes => ActivePanel::BpfWhitelist,
+            ActivePanel::BpfWhitelist => ActivePanel::Logs,
+            ActivePanel::Logs => ActivePanel::Processes,
+        };
     }
 }
 
@@ -123,11 +140,14 @@ impl Tui {
                 .checked_sub(last_tick.elapsed())
                 .unwrap_or(Duration::from_secs(0));
 
-            if event::poll(timeout)?
-                && let Event::Key(key) = event::read()?
-                && key.code == KeyCode::Char('q')
-            {
-                break;
+            if event::poll(timeout)? {
+                if let Event::Key(key) = event::read()? {
+                    match key.code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Tab => self.state.next_panel(),
+                        _ => {}
+                    }
+                }
             }
 
             if last_tick.elapsed() >= tick_rate {
@@ -196,6 +216,17 @@ impl Tui {
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(main_chunks[0]);
 
+        // Helper to determine active border highlighting
+        let get_border_style = |panel: ActivePanel| {
+            if self.state.active_panel == panel {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            }
+        };
+
         // left panel: userspace processes
         let process_rows: Vec<Row> = self
             .state
@@ -240,7 +271,8 @@ impl Tui {
         .block(
             Block::default()
                 .title(" LIVE PROCESS TRACKING (Userspace) ")
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_style(get_border_style(ActivePanel::Processes)),
         );
 
         f.render_widget(process_table, top_chunks[0]);
@@ -280,7 +312,8 @@ impl Tui {
         .block(
             Block::default()
                 .title(" BPF KERNEL MAPS (Whitelist) ")
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_style(get_border_style(ActivePanel::BpfWhitelist)),
         );
 
         f.render_widget(bpf_table, top_chunks[1]);
@@ -302,8 +335,9 @@ impl Tui {
 
         let log_list = List::new(logs).block(
             Block::default()
-                .title(" SYSTEM ACTIVITY LOGS (Press 'q' to exit) ")
-                .borders(Borders::ALL),
+                .title(" SYSTEM ACTIVITY LOGS (Press 'q' to exit, 'Tab' to switch panels) ")
+                .borders(Borders::ALL)
+                .border_style(get_border_style(ActivePanel::Logs)),
         );
 
         f.render_widget(log_list, main_chunks[1]);
