@@ -123,7 +123,7 @@ impl Tui {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        let tick_rate = Duration::from_millis(50);
+        let tick_rate = Duration::from_millis(250);
         let mut last_tick = Instant::now();
 
         loop {

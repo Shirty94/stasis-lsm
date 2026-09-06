@@ -222,23 +222,19 @@ async fn main() -> anyhow::Result<()> {
     // ACTIVE KERNEL MAP POLLING
     let whitelist_map_shared = SharedMap(whitelist_map);
     let ui_tx_poll = ui_tx.clone();
+    let tracker_poll = process_tracker.clone();
 
     tokio::spawn(async move {
         let whitelist_map = whitelist_map_shared;
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(2000));
 
         loop {
             interval.tick().await;
 
-            let mut keys = Vec::new();
-            for key_bytes in whitelist_map.keys() {
-                if let Ok(key_array) = key_bytes.as_slice().try_into() {
-                    let key = u32::from_ne_bytes(key_array);
-                    keys.push(key);
-                }
-            }
+            // Only query the PIDs we know are actively whitelisted in userspace
+            let active_pids = tracker_poll.get_temp_whitelisted_pids();
 
-            for pid in keys {
+            for pid in active_pids {
                 let key_bytes = pid.to_ne_bytes();
                 if let Ok(Some(val_bytes)) =
                     whitelist_map.lookup(&key_bytes, libbpf_rs::MapFlags::ANY)
@@ -272,14 +268,14 @@ async fn main() -> anyhow::Result<()> {
 
                 let needs_active_analysis = process_tracker.handle_file_open(pid, comm_str);
 
-                if needs_active_analysis {
-                    // only spawn a task if we need to do heavy active analysis
-                    let permit = analysis_semaphore.clone().acquire_owned().await?;
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        // future heavy checks go here
-                    });
-                }
+                // if needs_active_analysis {
+                //     // only spawn a task if we need to do heavy active analysis
+                //     let permit = analysis_semaphore.clone().acquire_owned().await?;
+                //     tokio::spawn(async move {
+                //         let _permit = permit;
+                //         // future heavy checks go here
+                //     });
+                // }
             }
             1 => {
                 let path = sample.path_str().to_string();

@@ -134,7 +134,7 @@ impl ProcessTracker {
 
             ProcessState::Monitoring { .. } => {
                 let count = context.file_open_count.fetch_add(1, Ordering::Relaxed);
-                self.update_ui_proc(pid, &comm, "Monitoring", count);
+                // self.update_ui_proc(pid, &comm, "Monitoring", count);
                 true
             }
 
@@ -169,12 +169,12 @@ impl ProcessTracker {
                         true
                     } else {
                         let count = context.file_open_count.load(Ordering::Relaxed);
-                        self.update_ui_proc(pid, &comm, "Whitelisted (Temp)", count);
+                        //self.update_ui_proc(pid, &comm, "Whitelisted (Temp)", count);
                         false // bypass remaining analysis
                     }
                 } else {
                     let count = context.file_open_count.load(Ordering::Relaxed);
-                    self.update_ui_proc(pid, &comm, "Whitelisted (Perm)", count);
+                    //self.update_ui_proc(pid, &comm, "Whitelisted (Perm)", count);
                     false // permanently whitelisted, bypass always
                 }
             }
@@ -215,10 +215,11 @@ impl ProcessTracker {
 
         if let ProcessState::Monitoring { .. } = *state {
             *state = ProcessState::EvaluationPending;
-            self.update_ui_proc(pid, comm, "Evaluating", 0);
             drop(state); // drop guard during the evaluation
 
             let count = context.file_open_count.swap(0, Ordering::Relaxed);
+            self.update_ui_proc(pid, comm, "Evaluating", count);
+
             let metrics = EvaluationMetrics {
                 file_open_count: count,
                 duration: Duration::from_secs(1),
@@ -417,5 +418,17 @@ impl ProcessTracker {
             ),
         );
         self.update_ui_proc(pid, name, "Idle", 0);
+    }
+
+    /// Returns a list of PIDs currently temporarily whitelisted in userspace
+    pub fn get_temp_whitelisted_pids(&self) -> Vec<u32> {
+        self.processes
+            .iter()
+            .filter(|r| {
+                let state = r.value().state.lock().unwrap();
+                matches!(*state, ProcessState::Whitelisted { expiry: Some(_) })
+            })
+            .map(|r| *r.key())
+            .collect()
     }
 }
