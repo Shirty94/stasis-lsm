@@ -201,48 +201,24 @@ async fn main() -> anyhow::Result<()> {
                 }
                 BpfCommand::WhitelistRemove { pid } => {
                     let key = pid.to_ne_bytes();
-                    if let Err(e) = bpf_whitelist_map.delete(&key) {
-                        if e.kind() != libbpf_rs::ErrorKind::NotFound {
-                            let _ = ui_tx_bpf.try_send(UiEvent::Log {
-                                level: "ERROR".to_string(),
-                                msg: format!(
-                                    "Failed to delete BPF whitelist for PID {}: {:?}",
-                                    pid, e
-                                ),
-                            });
+                    match bpf_whitelist_map.delete(&key) {
+                        Ok(_) => {
+                            let _ = ui_tx_bpf.try_send(UiEvent::BpfWhitelistRemove { pid });
                         }
-                    } else {
-                        let _ = ui_tx_bpf.try_send(UiEvent::BpfWhitelistRemove { pid });
-                    }
-                }
-            }
-        }
-    });
-
-    // ACTIVE KERNEL MAP POLLING
-    let whitelist_map_shared = SharedMap(whitelist_map);
-    let ui_tx_poll = ui_tx.clone();
-    let tracker_poll = process_tracker.clone();
-
-    tokio::spawn(async move {
-        let whitelist_map = whitelist_map_shared;
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(2000));
-
-        loop {
-            interval.tick().await;
-
-            // Only query the PIDs we know are actively whitelisted in userspace
-            let active_pids = tracker_poll.get_temp_whitelisted_pids();
-
-            for pid in active_pids {
-                let key_bytes = pid.to_ne_bytes();
-                if let Ok(Some(val_bytes)) =
-                    whitelist_map.lookup(&key_bytes, libbpf_rs::MapFlags::ANY)
-                {
-                    if let Ok(val_array) = val_bytes.as_slice().try_into() {
-                        let value = u32::from_ne_bytes(val_array);
-                        let _ =
-                            ui_tx_poll.try_send(UiEvent::BpfWhitelistCounterUpdate { pid, value });
+                        Err(e) => {
+                            if e.kind() == libbpf_rs::ErrorKind::NotFound {
+                                // if kernel tracepoint cleared it first still remove from the UI
+                                let _ = ui_tx_bpf.try_send(UiEvent::BpfWhitelistRemove { pid });
+                            } else {
+                                let _ = ui_tx_bpf.try_send(UiEvent::Log {
+                                    level: "ERROR".to_string(),
+                                    msg: format!(
+                                        "Failed to delete BPF whitelist for PID {}: {:?}",
+                                        pid, e
+                                    ),
+                                });
+                            }
+                        }
                     }
                 }
             }

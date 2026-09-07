@@ -51,13 +51,15 @@ pub enum UiEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivePanel {
     Processes,
-    BpfWhitelist,
+    Alerts,
     Logs,
 }
 
-struct BpfWhitelistState {
+struct AlertUiState {
+    pid: u32,
     comm: String,
-    value: u32,
+    count: u32,
+    active: bool,
 }
 
 struct ProcessUiState {
@@ -69,8 +71,7 @@ struct ProcessUiState {
 
 struct TuiState {
     processes: HashMap<u32, ProcessUiState>,
-    bpf_whitelist: HashMap<u32, BpfWhitelistState>,
-    bpf_blacklist: HashMap<u32, u8>,
+    alerts: HashMap<u32, AlertUiState>,
     logs: VecDeque<(String, String)>, // (level, message)
     active_panel: ActivePanel,
 }
@@ -79,8 +80,7 @@ impl TuiState {
     fn new() -> Self {
         Self {
             processes: HashMap::new(),
-            bpf_whitelist: HashMap::new(),
-            bpf_blacklist: HashMap::new(),
+            alerts: HashMap::new(),
             logs: VecDeque::with_capacity(MAX_LOGS),
             active_panel: ActivePanel::Processes,
         }
@@ -95,8 +95,8 @@ impl TuiState {
 
     fn next_panel(&mut self) {
         self.active_panel = match self.active_panel {
-            ActivePanel::Processes => ActivePanel::BpfWhitelist,
-            ActivePanel::BpfWhitelist => ActivePanel::Logs,
+            ActivePanel::Processes => ActivePanel::Alerts,
+            ActivePanel::Alerts => ActivePanel::Logs,
             ActivePanel::Logs => ActivePanel::Processes,
         };
     }
@@ -115,52 +115,90 @@ impl Tui {
         }
     }
 
-    /// Starts the main TUI event loop. Runs in a blocking context.
-    pub fn run(mut self) -> Result<(), Box<dyn std::error::Error>> {
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend)?;
+    /// Prints a beautifully formatted colored line to stdout when TUI is inactive.
+    fn print_cli_log(event: &UiEvent) {
+        if let UiEvent::Log { level, msg } = event {
+            let color_code = match level.as_str() {
+                "ALERT" => "\x1b[1;31m", // Bold Red
+                "WARN" => "\x1b[1;33m",  // Bold Yellow
+                _ => "\x1b[1;36m",       // Bold Cyan
+            };
+            // \x1b[0m resets the text formatting
+            println!("{}[{}]\x1b[0m {}", color_code, level, msg);
+        }
+    }
 
-        let tick_rate = Duration::from_millis(250);
-        let mut last_tick = Instant::now();
+    /// Starts the main TUI event loop with a CLI fallback mode.
+    pub fn run(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut tui_active = true;
 
         loop {
-            // draw the UI
-            terminal.draw(|f| self.draw(f))?;
+            if tui_active {
+                // initialize raw mode & alternate screen buffer
+                enable_raw_mode()?;
+                let mut stdout = io::stdout();
+                execute!(stdout, EnterAlternateScreen)?;
+                let backend = CrosstermBackend::new(stdout);
+                let mut terminal = Terminal::new(backend)?;
+                terminal.hide_cursor()?;
 
-            // process incoming internal updates (drain the channel)
-            while let Ok(event) = self.rx.try_recv() {
-                self.handle_ui_event(event);
-            }
+                let tick_rate = Duration::from_millis(1000);
+                let mut last_tick = Instant::now();
 
-            // process terminal user inputs (non-blocking poll)
-            let timeout = tick_rate
-                .checked_sub(last_tick.elapsed())
-                .unwrap_or(Duration::from_secs(0));
+                // active TUI loop
+                loop {
+                    terminal.draw(|f| self.draw(f))?;
 
-            if event::poll(timeout)? {
-                if let Event::Key(key) = event::read()? {
-                    match key.code {
-                        KeyCode::Char('q') => break,
-                        KeyCode::Tab => self.state.next_panel(),
-                        _ => {}
+                    // drain channel updates and update UI state
+                    while let Ok(event) = self.rx.try_recv() {
+                        self.handle_ui_event(event);
+                    }
+
+                    let timeout = tick_rate
+                        .checked_sub(last_tick.elapsed())
+                        .unwrap_or(Duration::from_secs(0));
+
+                    if event::poll(timeout)? {
+                        if let Event::Key(key) = event::read()? {
+                            match key.code {
+                                KeyCode::Char('q') => {
+                                    tui_active = false;
+                                    break;
+                                }
+                                KeyCode::Tab => self.state.next_panel(),
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    if last_tick.elapsed() >= tick_rate {
+                        last_tick = Instant::now();
                     }
                 }
-            }
 
-            if last_tick.elapsed() >= tick_rate {
-                last_tick = Instant::now();
+                // cleanly restore terminal to normal shell state
+                disable_raw_mode()?;
+                execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                terminal.show_cursor()?;
+
+                println!("\n\x1b[1;33m[SYSTEM] TUI suspended. Monitoring continues in background.\x1b[0m");
+                println!("\x1b[33mPress ENTER to restore TUI. Streaming live alerts below:\x1b[0m\n");
+            } else {
+                // check for keyboard input to resume TUI (blocks for up to 100ms)
+                if event::poll(Duration::from_millis(100))? {
+                    if let Event::Key(_) = event::read()? {
+                        tui_active = true;
+                        continue;
+                    }
+                }
+
+                // stream events to stdout & update underlying TUI state
+                while let Ok(event) = self.rx.try_recv() {
+                    Self::print_cli_log(&event);
+                    self.handle_ui_event(event);
+                }
             }
         }
-
-        // restore terminal on exit
-        disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-        terminal.show_cursor()?;
-
-        Ok(())
     }
 
     fn handle_ui_event(&mut self, event: UiEvent) {
@@ -174,32 +212,37 @@ impl Tui {
                 self.state.processes.insert(
                     pid,
                     ProcessUiState {
-                        comm,
-                        state,
+                        comm: comm.clone(),
+                        state: state.clone(),
                         count,
                         last_update: Instant::now(),
                     },
                 );
+
+                if state.contains("Alerted") {
+                    self.state.alerts.insert(
+                        pid,
+                        AlertUiState {
+                            pid,
+                            comm,
+                            count,
+                            active: true,
+                        },
+                    );
+                }
             }
             UiEvent::ProcessExited { pid } => {
                 self.state.processes.remove(&pid);
-            }
-            UiEvent::BpfWhitelistAdd { pid, comm, value } => {
-                self.state
-                    .bpf_whitelist
-                    .insert(pid, BpfWhitelistState { comm, value });
-            }
-            UiEvent::BpfWhitelistRemove { pid } => {
-                self.state.bpf_whitelist.remove(&pid);
-            }
-            UiEvent::BpfWhitelistCounterUpdate { pid, value } => {
-                if let Some(entry) = self.state.bpf_whitelist.get_mut(&pid) {
-                    entry.value = value;
+                if let Some(alert) = self.state.alerts.get_mut(&pid) {
+                    alert.active = false;
                 }
             }
             UiEvent::Log { level, msg } => {
                 self.state.push_log(level, msg);
             }
+            UiEvent::BpfWhitelistAdd { .. }
+            | UiEvent::BpfWhitelistRemove { .. }
+            | UiEvent::BpfWhitelistCounterUpdate { .. } => {}
         }
     }
 
@@ -216,7 +259,7 @@ impl Tui {
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(main_chunks[0]);
 
-        // Helper to determine active border highlighting
+        // helper to determine active border highlighting
         let get_border_style = |panel: ActivePanel| {
             if self.state.active_panel == panel {
                 Style::default()
@@ -270,53 +313,59 @@ impl Tui {
         )
         .block(
             Block::default()
-                .title(" LIVE PROCESS TRACKING (Userspace) ")
+                .title(" LIVE PROCESS TRACKING ")
                 .borders(Borders::ALL)
                 .border_style(get_border_style(ActivePanel::Processes)),
         );
 
         f.render_widget(process_table, top_chunks[0]);
 
-        // right panel: kernel map status
-        let bpf_rows: Vec<Row> = self
+        // right panel: threat alerts
+        let alert_rows: Vec<Row> = self
             .state
-            .bpf_whitelist
+            .alerts
             .iter()
-            .map(|(&pid, entry)| {
-                let status = if entry.value == 0xFFFFFFFF {
-                    "Permanent Bypass".to_string()
+            .map(|(&pid, alert)| {
+                let (status_str, style) = if alert.active {
+                    (
+                        "ACTIVE THREAT",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )
                 } else {
-                    format!("Counter: {} / 10000", entry.value)
+                    ("TERMINATED", Style::default().fg(Color::DarkGray))
                 };
 
-                Row::new(vec![pid.to_string(), status, entry.comm.clone()])
-                    .style(Style::default().fg(Color::Green))
+                Row::new(vec![
+                    pid.to_string(),
+                    alert.comm.clone(),
+                    alert.count.to_string(),
+                    status_str.to_string(),
+                ])
+                .style(style)
             })
             .collect();
 
-        let bpf_table = Table::new(
-            bpf_rows,
+        let alert_table = Table::new(
+            alert_rows,
             [
                 Constraint::Percentage(15),
                 Constraint::Percentage(40),
-                Constraint::Percentage(45),
+                Constraint::Percentage(20),
+                Constraint::Percentage(25),
             ],
         )
         .header(
-            Row::new(vec!["PID", "STATUS", "COMM"]).style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Row::new(vec!["PID", "COMM", "OPENS", "STATUS"])
+                .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
         )
         .block(
             Block::default()
-                .title(" BPF KERNEL MAPS (Whitelist) ")
+                .title(" SUSPICIOUS & BLOCKED PROCESSES ")
                 .borders(Borders::ALL)
-                .border_style(get_border_style(ActivePanel::BpfWhitelist)),
+                .border_style(get_border_style(ActivePanel::Alerts)),
         );
 
-        f.render_widget(bpf_table, top_chunks[1]);
+        f.render_widget(alert_table, top_chunks[1]);
 
         // bottom panel: system activity logs
         let logs: Vec<ListItem> = self
