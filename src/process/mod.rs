@@ -333,8 +333,10 @@ impl ProcessTracker {
             {
                 abort_handle.abort();
             }
-            // ensure BPF map entries are removed
+            // ensure BPF map entries and TUI entries are removed
             let _ = self.bpf_tx.try_send(BpfCommand::WhitelistRemove { pid });
+            let _ = self.ui_tx.try_send(UiEvent::ProcessExited { pid });
+
             self.ui_log(
                 "INFO",
                 format!(
