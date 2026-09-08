@@ -170,7 +170,7 @@ async fn main() -> anyhow::Result<()> {
 
     let ui_tx_rb = ui_tx.clone();
     tokio::task::spawn_blocking(move || {
-        let mut ringbuf = ringbuf;
+        let ringbuf = ringbuf;
         loop {
             if let Err(e) = ringbuf.0.poll(std::time::Duration::from_millis(100)) {
                 let _ = ui_tx_rb.try_send(UiEvent::Log {
@@ -233,7 +233,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // maximum number of parallel tasks for event handling
-    let analysis_semaphore = Arc::new(Semaphore::new(MAX_TASKS));
+    let _analysis_semaphore = Arc::new(Semaphore::new(MAX_TASKS));
 
     while let Some(sample) = rx.recv().await {
         match sample.event_type {
@@ -242,7 +242,7 @@ async fn main() -> anyhow::Result<()> {
                 let pid = sample.pid;
                 let comm_str = sample.comm_str().to_string();
 
-                let needs_active_analysis = process_tracker.handle_file_open(pid, comm_str);
+                let _needs_active_analysis = process_tracker.handle_file_open(pid, comm_str);
 
                 // if needs_active_analysis {
                 //     // only spawn a task if we need to do heavy active analysis
