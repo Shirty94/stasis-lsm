@@ -12,8 +12,9 @@ use ratatui::{
 };
 use std::{
     collections::{HashMap, VecDeque},
-    io,
-    time::{Duration, Instant},
+    fs::{File, OpenOptions},
+    io::{self, Write},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::mpsc;
 
@@ -105,13 +106,23 @@ impl TuiState {
 pub struct Tui {
     rx: mpsc::Receiver<UiEvent>,
     state: TuiState,
+    log_file: Option<File>,
 }
 
 impl Tui {
     pub fn new(rx: mpsc::Receiver<UiEvent>) -> Self {
+        // Open (or create) the session log in /tmp, truncating previous runs
+        let log_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open("/tmp/stasis_engine.log")
+            .ok();
+
         Self {
             rx,
             state: TuiState::new(),
+            log_file,
         }
     }
 
@@ -131,6 +142,18 @@ impl Tui {
     /// Starts the main TUI event loop with a CLI fallback mode.
     pub fn run(mut self) -> Result<(), Box<dyn std::error::Error>> {
         let mut tui_active = true;
+
+        if self.log_file.is_some() {
+            self.state.push_log(
+                "INFO".to_string(),
+                "Session logging initialized at /tmp/stasis_engine.log".to_string(),
+            );
+        } else {
+            self.state.push_log(
+                "WARN".to_string(),
+                "Failed to initialize session log file at /tmp/stasis_engine.log".to_string(),
+            );
+        }
 
         loop {
             if tui_active {
@@ -242,7 +265,18 @@ impl Tui {
                 }
             }
             UiEvent::Log { level, msg } => {
-                self.state.push_log(level, msg);
+                // write to local memory buffer for active TUI draw
+                self.state.push_log(level.clone(), msg.clone());
+
+                // append to persistent session log file with epoch timestamp
+                if let Some(ref mut file) = self.log_file {
+                    let epoch_secs = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+
+                    let _ = writeln!(file, "[{}] [{}] {}", epoch_secs, level, msg);
+                }
             }
             UiEvent::BpfWhitelistAdd { .. }
             | UiEvent::BpfWhitelistRemove { .. }
