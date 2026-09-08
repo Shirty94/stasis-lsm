@@ -239,10 +239,10 @@ int BPF_PROG(file_open, struct file *file) {
   // get command name
   bpf_get_current_comm(&e_sample->comm, sizeof(e_sample->comm));
 
-  // Clear union to prevent kernel data leaks
+  // clear union to prevent kernel data leaks
   __builtin_memset(&e_sample->data, 0, sizeof(e_sample->data));
 
-  // Access the union directly to avoid uninitialized pointer bugs
+  // access the union directly to avoid uninitialized pointer bugs
   e_sample->data.fopen_data.flags = file->f_flags;
   bpf_probe_read_str(e_sample->data.fopen_data.path,
                      sizeof(e_sample->data.fopen_data.path),
@@ -257,12 +257,11 @@ SEC("lsm.s/bprm_creds_for_exec")
 int BPF_PROG(bprm_creds_for_exec, struct linux_binprm *bprm) {
   u32 pid = bpf_get_current_pid_tgid() >> 32;
 
-  // Immediately evict stale rules for this recycled PID in-kernel
+  // immediately evict stale rules for this PID in-kernel
   bpf_map_delete_elem(&whitelist, &pid);
   bpf_map_delete_elem(&blacklist, &pid);
 
-  // Directly dereference. Since this is a sleepable LSM hook, the verifier
-  // permits direct access and preserves the "trusted pointer" type.
+  // directly dereference
   struct file *file = bprm->file;
   if (!file) {
     return 0;
@@ -271,7 +270,14 @@ int BPF_PROG(bprm_creds_for_exec, struct linux_binprm *bprm) {
   char fpath_buf[MAX_PATH_LEN] = {0};
   long ret = bpf_d_path(&file->f_path, fpath_buf, sizeof(fpath_buf));
   if (ret < 0) {
-    return 0;
+    // FALLBACK: If bpf_d_path fails, read the binary filename
+    // directly from the linux_binprm struct
+    const char *filename = BPF_CORE_READ(bprm, filename);
+    if (filename) {
+      bpf_probe_read_kernel_str(fpath_buf, sizeof(fpath_buf), filename);
+    } else {
+      return 0; // absolute dead-end, drop event
+    }
   }
 
   struct event_sample *e_sample = bpf_ringbuf_reserve(&event_rb, sizeof(struct event_sample), 0);
@@ -300,12 +306,12 @@ int handle_exit(void *ctx) {
   u32 tgid = pid_tgid >> 32;
   u32 tid = (u32)pid_tgid;
 
-  // Only handle main thread exit to avoid multi-thread event spam
+  // only handle main thread exit to avoid multi-thread event spam
   if (tgid != tid) {
     return 0;
   }
 
-  // Immediately evict stale rules in-kernel
+  // immediately evict stale rules in-kernel
   bpf_map_delete_elem(&whitelist, &tgid);
   bpf_map_delete_elem(&blacklist, &tgid);
 

@@ -158,16 +158,16 @@ impl Tui {
                         .checked_sub(last_tick.elapsed())
                         .unwrap_or(Duration::from_secs(0));
 
-                    if event::poll(timeout)? {
-                        if let Event::Key(key) = event::read()? {
-                            match key.code {
-                                KeyCode::Char('q') => {
-                                    tui_active = false;
-                                    break;
-                                }
-                                KeyCode::Tab => self.state.next_panel(),
-                                _ => {}
+                    if event::poll(timeout)?
+                        && let Event::Key(key) = event::read()?
+                    {
+                        match key.code {
+                            KeyCode::Char('q') => {
+                                tui_active = false;
+                                break;
                             }
+                            KeyCode::Tab => self.state.next_panel(),
+                            _ => {}
                         }
                     }
 
@@ -181,15 +181,19 @@ impl Tui {
                 execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
                 terminal.show_cursor()?;
 
-                println!("\n\x1b[1;33m[SYSTEM] TUI suspended. Monitoring continues in background.\x1b[0m");
-                println!("\x1b[33mPress ENTER to restore TUI. Streaming live alerts below:\x1b[0m\n");
+                println!(
+                    "\n\x1b[1;33m[SYSTEM] TUI suspended. Monitoring continues in background.\x1b[0m"
+                );
+                println!(
+                    "\x1b[33mPress ENTER to restore TUI. Streaming live alerts below:\x1b[0m\n"
+                );
             } else {
                 // check for keyboard input to resume TUI (blocks for up to 100ms)
-                if event::poll(Duration::from_millis(100))? {
-                    if let Event::Key(_) = event::read()? {
-                        tui_active = true;
-                        continue;
-                    }
+                if event::poll(Duration::from_millis(100))?
+                    && let Event::Key(_) = event::read()?
+                {
+                    tui_active = true;
+                    continue;
                 }
 
                 // stream events to stdout & update underlying TUI state
@@ -285,27 +289,21 @@ impl Tui {
                     _ => Style::default().fg(Color::DarkGray),
                 };
 
-                Row::new(vec![
-                    pid.to_string(),
-                    p.comm.clone(),
-                    p.state.clone(),
-                    p.count.to_string(),
-                ])
-                .style(state_style)
+                Row::new(vec![pid.to_string(), p.comm.clone(), p.state.clone()]).style(state_style)
             })
             .collect();
 
         let process_table = Table::new(
             process_rows,
             [
-                Constraint::Percentage(20),
-                Constraint::Percentage(30),
-                Constraint::Percentage(35),
-                Constraint::Percentage(15),
+                Constraint::Percentage(12), // PID
+                Constraint::Percentage(60), // COMM (High-fidelity path)
+                Constraint::Percentage(28), // STATE
             ],
         )
         .header(
-            Row::new(vec!["PID", "COMM", "STATE", "OPENS"]).style(
+            // Removed "OPENS" header
+            Row::new(vec!["PID", "COMM", "STATE"]).style(
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),

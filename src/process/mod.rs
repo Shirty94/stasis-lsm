@@ -46,6 +46,8 @@ pub enum ProcessState {
 pub struct ProcessContext {
     pub _pid: u32,
     pub state: Mutex<ProcessState>,
+    // The best-known display name for the program (Full path if exec'd, fallback to COMM)
+    pub comm: Mutex<String>,
     // AtomicU32 for safe async incrementing
     pub file_open_count: AtomicU32,
     // future metrics:
@@ -54,10 +56,11 @@ pub struct ProcessContext {
 }
 
 impl ProcessContext {
-    pub fn new(_pid: u32) -> Self {
+    pub fn new(_pid: u32, comm: String) -> Self {
         Self {
             _pid,
             state: Mutex::new(ProcessState::Idle),
+            comm: Mutex::new(comm),
             file_open_count: AtomicU32::new(0),
         }
     }
@@ -104,9 +107,20 @@ impl ProcessTracker {
         let context = self
             .processes
             .entry(pid)
-            .or_insert_with(|| Arc::new(ProcessContext::new(pid)))
+            .or_insert_with(|| {
+                // FALLBACK: if we missed the exec event (or the process was forked without exec),
+                // read its true executable path from /proc/<pid>/exe
+                let real_path = std::fs::read_link(format!("/proc/{}/exe", pid))
+                    .ok()
+                    .and_then(|p| p.to_str().map(|s| s.to_string()))
+                    .unwrap_or(comm);
+
+                Arc::new(ProcessContext::new(pid, real_path))
+            })
             .clone();
 
+        // Always use the highest-quality saved comm string (the full path if we have it)
+        let display_comm = context.comm.lock().unwrap().clone();
         let mut state = context.state.lock().unwrap();
 
         match *state {
@@ -116,10 +130,9 @@ impl ProcessTracker {
                 let deadline = Instant::now() + monitor_duration;
 
                 let tracker = self.clone();
-                let comm_clone = comm.clone();
                 let join_handle = tokio::spawn(async move {
                     tokio::time::sleep(monitor_duration).await;
-                    tracker.evaluate(pid, &comm_clone);
+                    tracker.evaluate(pid);
                 });
 
                 *state = ProcessState::Monitoring {
@@ -128,19 +141,18 @@ impl ProcessTracker {
                 };
 
                 context.file_open_count.store(1, Ordering::Relaxed);
-                self.update_ui_proc(pid, &comm, "Monitoring", 1);
+                self.update_ui_proc(pid, &display_comm, "Monitoring", 1);
                 true
             }
 
             ProcessState::Monitoring { .. } => {
-                let count = context.file_open_count.fetch_add(1, Ordering::Relaxed);
-                // self.update_ui_proc(pid, &comm, "Monitoring", count);
+                let _count = context.file_open_count.fetch_add(1, Ordering::Relaxed);
                 true
             }
 
             ProcessState::EvaluationPending => {
                 let count = context.file_open_count.load(Ordering::Relaxed);
-                self.update_ui_proc(pid, &comm, "Evaluation Pending", count);
+                self.update_ui_proc(pid, &display_comm, "Evaluation Pending", count);
                 // ignore events while calculating evaluation to prevent race conditions.
                 false
             }
@@ -153,10 +165,9 @@ impl ProcessTracker {
                         let deadline = Instant::now() + monitor_duration;
 
                         let tracker = self.clone();
-                        let comm_clone = comm.clone();
                         let join_handle = tokio::spawn(async move {
                             tokio::time::sleep(monitor_duration).await;
-                            tracker.evaluate(pid, &comm_clone);
+                            tracker.evaluate(pid);
                         });
 
                         *state = ProcessState::Monitoring {
@@ -165,16 +176,12 @@ impl ProcessTracker {
                         };
 
                         context.file_open_count.store(1, Ordering::Relaxed);
-                        self.update_ui_proc(pid, &comm, "Monitoring", 1);
+                        self.update_ui_proc(pid, &display_comm, "Monitoring", 1);
                         true
                     } else {
-                        let count = context.file_open_count.load(Ordering::Relaxed);
-                        //self.update_ui_proc(pid, &comm, "Whitelisted (Temp)", count);
                         false // bypass remaining analysis
                     }
                 } else {
-                    let count = context.file_open_count.load(Ordering::Relaxed);
-                    //self.update_ui_proc(pid, &comm, "Whitelisted (Perm)", count);
                     false // permanently whitelisted, bypass always
                 }
             }
@@ -184,33 +191,30 @@ impl ProcessTracker {
             } => {
                 let count = context.file_open_count.load(Ordering::Relaxed);
                 if Instant::now() >= *cooldown_until {
-                    // alert cooldown expired, re-alert. Could maybe
-                    // switch this to a background timer, but should
-                    // be fine like this, no activity -> no need to
-                    // re-alert anyway
                     *alert_count += 1;
                     *cooldown_until = Instant::now() + Duration::from_secs(5);
                     self.ui_log(
                         "ALERT",
                         format!(
                             "PID {} ({}) still misbehaving! (Alert Count: {})",
-                            pid, comm, alert_count
+                            pid, display_comm, alert_count
                         ),
                     );
                 }
-                self.update_ui_proc(pid, &comm, "Alerted", count);
+                self.update_ui_proc(pid, &display_comm, "Alerted", count);
                 true
             }
         }
     }
 
     /// Run evaluation when the monitoring timer expires.
-    fn evaluate(&self, pid: u32, comm: &str) {
+    fn evaluate(&self, pid: u32) {
         let context = match self.processes.get(&pid) {
             Some(ctx) => ctx.clone(),
             None => return,
         };
 
+        let comm = context.comm.lock().unwrap().clone();
         let mut state = context.state.lock().unwrap();
 
         if let ProcessState::Monitoring { .. } = *state {
@@ -218,7 +222,7 @@ impl ProcessTracker {
             drop(state); // drop guard during the evaluation
 
             let count = context.file_open_count.swap(0, Ordering::Relaxed);
-            self.update_ui_proc(pid, comm, "Evaluating", count);
+            self.update_ui_proc(pid, &comm, "Evaluating", count);
 
             let metrics = EvaluationMetrics {
                 file_open_count: count,
@@ -239,7 +243,7 @@ impl ProcessTracker {
                             pid, comm, count
                         ),
                     );
-                    self.update_ui_proc(pid, comm, "Idle", 0);
+                    self.update_ui_proc(pid, &comm, "Idle", 0);
                 }
                 Decision::WhitelistTemp { duration } => {
                     let expiry = Instant::now() + duration;
@@ -262,13 +266,12 @@ impl ProcessTracker {
                                 pid, comm, duration
                             ),
                         );
-                        self.update_ui_proc(pid, comm, "Whitelisted (Temp)", 0);
+                        self.update_ui_proc(pid, &comm, "Whitelisted (Temp)", 0);
 
                         let tracker = self.clone();
-                        let comm_clone = comm.to_string();
                         tokio::spawn(async move {
                             tokio::time::sleep(duration).await;
-                            tracker.expire_whitelist(pid, &comm_clone, expiry);
+                            tracker.expire_whitelist(pid, expiry);
                         });
                     }
                 }
@@ -285,15 +288,16 @@ impl ProcessTracker {
                             pid, comm, count
                         ),
                     );
-                    self.update_ui_proc(pid, comm, "Alerted", count);
+                    self.update_ui_proc(pid, &comm, "Alerted", count);
                 }
             }
         }
     }
 
     /// Actively transitions an expired whitelist back to Idle and evicts it from kernel space.
-    fn expire_whitelist(&self, pid: u32, comm: &str, expected_expiry: Instant) {
+    fn expire_whitelist(&self, pid: u32, expected_expiry: Instant) {
         if let Some(context) = self.processes.get(&pid) {
+            let comm = context.comm.lock().unwrap().clone();
             let mut state = context.state.lock().unwrap();
 
             if let ProcessState::Whitelisted {
@@ -316,7 +320,7 @@ impl ProcessTracker {
                             pid, comm
                         ),
                     );
-                    self.update_ui_proc(pid, comm, "Idle", 0);
+                    self.update_ui_proc(pid, &comm, "Idle", 0);
                 }
             }
         }
@@ -355,7 +359,7 @@ impl ProcessTracker {
 
         // perform static whitelisting checks
         if self.is_permanently_whitelisted(&path) {
-            let context = Arc::new(ProcessContext::new(pid));
+            let context = Arc::new(ProcessContext::new(pid, path.clone()));
             {
                 let mut state = context.state.lock().unwrap();
                 *state = ProcessState::Whitelisted { expiry: None };
@@ -378,6 +382,9 @@ impl ProcessTracker {
             );
             self.update_ui_proc(pid, &path, "Whitelisted (Perm)", 0);
         } else {
+            let context = Arc::new(ProcessContext::new(pid, path.clone()));
+            self.processes.insert(pid, context);
+
             self.ui_log(
                 "INFO",
                 format!("PID {} ({}) exec'd. Initializing tracking.", pid, path),
@@ -399,7 +406,7 @@ impl ProcessTracker {
     /// Permanently whitelists a PID in both the userspace tracker and the eBPF map.
     /// This prevents recycled PIDs or early startup events from overwriting trusted states.
     pub fn whitelist_pid_permanently(&self, pid: u32, name: &str) {
-        let context = Arc::new(ProcessContext::new(pid));
+        let context = Arc::new(ProcessContext::new(pid, name.to_string()));
         {
             let mut state = context.state.lock().unwrap();
             *state = ProcessState::Whitelisted { expiry: None };
