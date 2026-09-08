@@ -67,17 +67,17 @@ impl SharedMap {
         self.0.delete(key)
     }
 
-    pub fn keys(&self) -> impl Iterator<Item = Vec<u8>> + '_ {
-        self.0.keys()
-    }
+    // pub fn keys(&self) -> impl Iterator<Item = Vec<u8>> + '_ {
+    //     self.0.keys()
+    // }
 
-    pub fn lookup(
-        &self,
-        key: &[u8],
-        flags: libbpf_rs::MapFlags,
-    ) -> Result<Option<Vec<u8>>, libbpf_rs::Error> {
-        self.0.lookup(key, flags)
-    }
+    // pub fn lookup(
+    //     &self,
+    //     key: &[u8],
+    //     flags: libbpf_rs::MapFlags,
+    // ) -> Result<Option<Vec<u8>>, libbpf_rs::Error> {
+    //     self.0.lookup(key, flags)
+    // }
 }
 
 struct SendRingBuffer<T>(T);

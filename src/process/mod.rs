@@ -429,15 +429,15 @@ impl ProcessTracker {
         self.update_ui_proc(pid, name, "Idle", 0);
     }
 
-    /// Returns a list of PIDs currently temporarily whitelisted in userspace
-    pub fn get_temp_whitelisted_pids(&self) -> Vec<u32> {
-        self.processes
-            .iter()
-            .filter(|r| {
-                let state = r.value().state.lock().unwrap();
-                matches!(*state, ProcessState::Whitelisted { expiry: Some(_) })
-            })
-            .map(|r| *r.key())
-            .collect()
-    }
+    // /// Returns a list of PIDs currently temporarily whitelisted in userspace
+    // pub fn get_temp_whitelisted_pids(&self) -> Vec<u32> {
+    //     self.processes
+    //         .iter()
+    //         .filter(|r| {
+    //             let state = r.value().state.lock().unwrap();
+    //             matches!(*state, ProcessState::Whitelisted { expiry: Some(_) })
+    //         })
+    //         .map(|r| *r.key())
+    //         .collect()
+    // }
 }
