@@ -67,17 +67,17 @@ impl SharedMap {
         self.0.delete(key)
     }
 
-    // pub fn keys(&self) -> impl Iterator<Item = Vec<u8>> + '_ {
-    //     self.0.keys()
-    // }
+    pub fn _keys(&self) -> impl Iterator<Item = Vec<u8>> + '_ {
+        self.0.keys()
+    }
 
-    // pub fn lookup(
-    //     &self,
-    //     key: &[u8],
-    //     flags: libbpf_rs::MapFlags,
-    // ) -> Result<Option<Vec<u8>>, libbpf_rs::Error> {
-    //     self.0.lookup(key, flags)
-    // }
+    pub fn _lookup(
+        &self,
+        key: &[u8],
+        flags: libbpf_rs::MapFlags,
+    ) -> Result<Option<Vec<u8>>, libbpf_rs::Error> {
+        self.0.lookup(key, flags)
+    }
 }
 
 struct SendRingBuffer<T>(T);
@@ -238,20 +238,13 @@ async fn main() -> anyhow::Result<()> {
     while let Some(sample) = rx.recv().await {
         match sample.event_type {
             0 => {
-                // EVENT_FILE_OPEN - process state synchronously to guarantee ordering
+                // EVENT_FILE_OPEN
                 let pid = sample.pid;
                 let comm_str = sample.comm_str().to_string();
+                let path_str = sample.path_str().to_string();
 
-                let _needs_active_analysis = process_tracker.handle_file_open(pid, comm_str);
-
-                // if needs_active_analysis {
-                //     // only spawn a task if we need to do heavy active analysis
-                //     let permit = analysis_semaphore.clone().acquire_owned().await?;
-                //     tokio::spawn(async move {
-                //         let _permit = permit;
-                //         // future heavy checks go here
-                //     });
-                // }
+                let _needs_active_analysis =
+                    process_tracker.handle_file_open(pid, comm_str, path_str);
             }
             1 => {
                 let path = sample.path_str().to_string();
@@ -260,6 +253,20 @@ async fn main() -> anyhow::Result<()> {
             2 => {
                 let comm_str = sample.comm_str().to_string();
                 process_tracker.handle_process_exit(sample.pid, &comm_str);
+            }
+            3 => {
+                // EVENT_FILE_WRITE
+                let pid = sample.pid;
+                let comm_str = sample.comm_str().to_string();
+                let path_str = sample.path_str().to_string();
+                process_tracker.handle_file_write(pid, comm_str, path_str);
+            }
+            4 => {
+                // EVENT_FILE_UNLINK
+                let pid = sample.pid;
+                let comm_str = sample.comm_str().to_string();
+                let path_str = sample.path_str().to_string();
+                process_tracker.handle_file_unlink(pid, comm_str, path_str);
             }
             _ => {}
         }

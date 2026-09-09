@@ -1,9 +1,15 @@
 use crate::suspicion::{self, Decision, EvaluationMetrics};
 use crate::tui::UiEvent;
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashSet,
+    path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::{Duration, Instant},
+};
 use tokio::{sync::mpsc, task::AbortHandle};
 
 const PERM_WHITELIST_VAL: u32 = 0xFFFFFFFF;
@@ -46,13 +52,11 @@ pub enum ProcessState {
 pub struct ProcessContext {
     pub _pid: u32,
     pub state: Mutex<ProcessState>,
-    // The best-known display name for the program (Full path if exec'd, fallback to COMM)
     pub comm: Mutex<String>,
-    // AtomicU32 for safe async incrementing
     pub file_open_count: AtomicU32,
-    // future metrics:
-    // pub opened_extensions: DashSet<String>,
-    // pub unique_directories: DashSet<PathBuf>,
+    pub file_write_count: AtomicU32,
+    pub file_unlink_count: AtomicU32,
+    pub opened_paths: Mutex<Vec<String>>,
 }
 
 impl ProcessContext {
@@ -62,6 +66,9 @@ impl ProcessContext {
             state: Mutex::new(ProcessState::Idle),
             comm: Mutex::new(comm),
             file_open_count: AtomicU32::new(0),
+            file_write_count: AtomicU32::new(0),
+            file_unlink_count: AtomicU32::new(0),
+            opened_paths: Mutex::new(Vec::new()),
         }
     }
 }
@@ -103,13 +110,11 @@ impl ProcessTracker {
 
     /// Handles an incoming file open event.
     /// Returns `true` if we should execute active userspace checks (like file entropy).
-    pub fn handle_file_open(&self, pid: u32, comm: String) -> bool {
+    pub fn handle_file_open(&self, pid: u32, comm: String, path: String) -> bool {
         let context = self
             .processes
             .entry(pid)
             .or_insert_with(|| {
-                // FALLBACK: if we missed the exec event (or the process was forked without exec),
-                // read its true executable path from /proc/<pid>/exe
                 let real_path = std::fs::read_link(format!("/proc/{}/exe", pid))
                     .ok()
                     .and_then(|p| p.to_str().map(|s| s.to_string()))
@@ -119,13 +124,14 @@ impl ProcessTracker {
             })
             .clone();
 
-        // Always use the highest-quality saved comm string (the full path if we have it)
+        // Always record the path being accessed
+        context.opened_paths.lock().unwrap().push(path);
+
         let display_comm = context.comm.lock().unwrap().clone();
         let mut state = context.state.lock().unwrap();
 
         match *state {
             ProcessState::Idle => {
-                // first event, start monitoring window.
                 let monitor_duration = Duration::from_secs(1);
                 let deadline = Instant::now() + monitor_duration;
 
@@ -146,21 +152,19 @@ impl ProcessTracker {
             }
 
             ProcessState::Monitoring { .. } => {
-                let _count = context.file_open_count.fetch_add(1, Ordering::Relaxed);
+                context.file_open_count.fetch_add(1, Ordering::Relaxed);
                 true
             }
 
             ProcessState::EvaluationPending => {
                 let count = context.file_open_count.load(Ordering::Relaxed);
                 self.update_ui_proc(pid, &display_comm, "Evaluation Pending", count);
-                // ignore events while calculating evaluation to prevent race conditions.
                 false
             }
 
             ProcessState::Whitelisted { expiry } => {
                 if let Some(expiry_time) = expiry {
                     if Instant::now() >= expiry_time {
-                        // whitelist expired, transition to monitoring
                         let monitor_duration = Duration::from_secs(1);
                         let deadline = Instant::now() + monitor_duration;
 
@@ -179,10 +183,10 @@ impl ProcessTracker {
                         self.update_ui_proc(pid, &display_comm, "Monitoring", 1);
                         true
                     } else {
-                        false // bypass remaining analysis
+                        false
                     }
                 } else {
-                    false // permanently whitelisted, bypass always
+                    false
                 }
             }
             ProcessState::Alerted {
@@ -207,6 +211,25 @@ impl ProcessTracker {
         }
     }
 
+    pub fn handle_file_write(&self, pid: u32, comm: String, path: String) {
+        if let Some(context) = self.processes.get(&pid) {
+            context.file_write_count.fetch_add(1, Ordering::Relaxed);
+            context.opened_paths.lock().unwrap().push(path);
+        } else {
+            // self-healing initialization for processes already active
+            self.handle_file_open(pid, comm, path);
+        }
+    }
+
+    pub fn handle_file_unlink(&self, pid: u32, comm: String, path: String) {
+        if let Some(context) = self.processes.get(&pid) {
+            context.file_unlink_count.fetch_add(1, Ordering::Relaxed);
+            context.opened_paths.lock().unwrap().push(path);
+        } else {
+            self.handle_file_open(pid, comm, path);
+        }
+    }
+
     /// Run evaluation when the monitoring timer expires.
     fn evaluate(&self, pid: u32) {
         let context = match self.processes.get(&pid) {
@@ -221,28 +244,81 @@ impl ProcessTracker {
             *state = ProcessState::EvaluationPending;
             drop(state); // drop guard during the evaluation
 
-            let count = context.file_open_count.swap(0, Ordering::Relaxed);
-            self.update_ui_proc(pid, &comm, "Evaluating", count);
+            let open_count = context.file_open_count.swap(0, Ordering::Relaxed);
+            let write_count = context.file_write_count.swap(0, Ordering::Relaxed);
+            let unlink_count = context.file_unlink_count.swap(0, Ordering::Relaxed);
+
+            // Extract and clear path collections
+            let paths = {
+                let mut guard = context.opened_paths.lock().unwrap();
+                std::mem::take(&mut *guard)
+            };
+
+            self.update_ui_proc(pid, &comm, "Evaluating", open_count);
+
+            // Compute structural metrics
+            let mut unique_dirs = HashSet::new();
+            let mut hvt_count = 0;
+
+            for p_str in &paths {
+                let path = Path::new(p_str);
+                if let Some(parent) = path.parent() {
+                    unique_dirs.insert(parent.to_path_buf());
+                }
+
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    let ext_lower = ext.to_lowercase();
+                    match ext_lower.as_str() {
+                        "docx" | "doc" | "pdf" | "xls" | "xlsx" | "ppt" | "pptx" | "odt"
+                        | "txt" | "zip" | "tar" | "gz" | "7z" | "rar" | "png" | "jpg" | "jpeg"
+                        | "mp4" | "sql" | "db" | "sqlite" | "key" | "pem" | "crt" => {
+                            hvt_count += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
 
             let metrics = EvaluationMetrics {
-                file_open_count: count,
+                file_open_count: open_count,
+                file_write_count: write_count,
+                file_unlink_count: unlink_count,
+                unique_directories: unique_dirs.len() as u32,
+                high_value_extension_count: hvt_count,
                 duration: Duration::from_secs(1),
             };
 
-            let decision = suspicion::evaluate(&metrics);
+            let eval_res = suspicion::evaluate(&metrics);
 
             let mut state = context.state.lock().unwrap();
-            match decision {
+
+            if !self.processes.contains_key(&pid) {
+                return;
+            }
+
+            // create a structured diagnostic breakdown string for debugging
+            let breakdown: Vec<String> = eval_res
+                .scores
+                .iter()
+                .map(|s| format!("{}: {:.2} (wt: {:.1})", s.name, s.score, s.weight))
+                .collect();
+            let diagnostic_log = format!(
+                "PID {} ({}) Evaluation: Score={:.2}, Metrics=[opens: {}, writes: {}, unlinks: {}, dirs: {}, hvts: {}]. Breakdown: [{}]",
+                pid,
+                comm,
+                eval_res.final_score,
+                metrics.file_open_count,
+                metrics.file_write_count,
+                metrics.file_unlink_count,
+                metrics.unique_directories,
+                metrics.high_value_extension_count,
+                breakdown.join(" | ")
+            );
+
+            match eval_res.decision {
                 Decision::KeepMonitoring => {
-                    // we reset to Idle, next file_open starts new window
                     *state = ProcessState::Idle;
-                    self.ui_log(
-                        "INFO",
-                        format!(
-                            "PID {} ({}) returned to Idle (gray zone, count: {})",
-                            pid, comm, count
-                        ),
-                    );
+                    self.ui_log("WARN", format!("Doubtful activity. {}", diagnostic_log));
                     self.update_ui_proc(pid, &comm, "Idle", 0);
                 }
                 Decision::WhitelistTemp { duration } => {
@@ -251,7 +327,6 @@ impl ProcessTracker {
                         expiry: Some(expiry),
                     };
 
-                    // ensure the process wasn't deleted already
                     if self.processes.contains_key(&pid) {
                         let _ = self.bpf_tx.try_send(BpfCommand::WhitelistAdd {
                             pid,
@@ -262,8 +337,8 @@ impl ProcessTracker {
                         self.ui_log(
                             "INFO",
                             format!(
-                                "PID {} ({}) dynamically whitelisted for {:?}",
-                                pid, comm, duration
+                                "Whitelisting (temp {:?}). Details: {}",
+                                duration, diagnostic_log
                             ),
                         );
                         self.update_ui_proc(pid, &comm, "Whitelisted (Temp)", 0);
@@ -281,14 +356,8 @@ impl ProcessTracker {
                         cooldown_until,
                         alert_count: 1,
                     };
-                    self.ui_log(
-                        "ALERT",
-                        format!(
-                            "PID {} ({}) triggered ransomware alert! ({} opens/sec)",
-                            pid, comm, count
-                        ),
-                    );
-                    self.update_ui_proc(pid, &comm, "Alerted", count);
+                    self.ui_log("ALERT", format!("THREAT DETECTED! {}", diagnostic_log));
+                    self.update_ui_proc(pid, &comm, "Alerted", open_count);
                 }
             }
         }

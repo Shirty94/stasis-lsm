@@ -330,9 +330,9 @@ impl Tui {
         let process_table = Table::new(
             process_rows,
             [
-                Constraint::Percentage(12), // PID
-                Constraint::Percentage(60), // COMM (High-fidelity path)
-                Constraint::Percentage(28), // STATE
+                Constraint::Percentage(10), // PID
+                Constraint::Percentage(70), // COMM (High-fidelity path)
+                Constraint::Percentage(20), // STATE
             ],
         )
         .header(
@@ -380,10 +380,10 @@ impl Tui {
         let alert_table = Table::new(
             alert_rows,
             [
+                Constraint::Percentage(10),
+                Constraint::Percentage(70),
+                Constraint::Percentage(5),
                 Constraint::Percentage(15),
-                Constraint::Percentage(40),
-                Constraint::Percentage(20),
-                Constraint::Percentage(25),
             ],
         )
         .header(

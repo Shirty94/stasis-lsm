@@ -44,8 +44,8 @@ impl EventSample {
     pub fn path_str(&self) -> &str {
         let path_bytes = unsafe {
             match self.event_type {
-                0 => &self.data.fopen_data.path[..], // EVENT_FILE_OPEN
-                1 => &self.data.pexec_data.path[..], // EVENT_PROCESS_EXEC
+                0 | 3 | 4 => &self.data.fopen_data.path[..], // OPEN, WRITE, UNLINK
+                1 => &self.data.pexec_data.path[..],         // EXEC
                 _ => &[],
             }
         };

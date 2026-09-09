@@ -33,11 +33,15 @@
 #define RINGBUF_SIZE 18 * 1024 * 1024
 #endif
 
-// Event types sent to userspace
+#define MAY_WRITE 0x02
+
+// event types sent to userspace
 enum event_type {
   EVENT_FILE_OPEN = 0,
   EVENT_PROCESS_EXEC = 1,
   EVENT_PROCESS_EXIT = 2,
+  EVENT_FILE_WRITE = 3,
+  EVENT_FILE_UNLINK = 4,
 };
 
 struct fopen_sample {
@@ -328,6 +332,130 @@ int handle_exit(void *ctx) {
 
   __builtin_memset(&e_sample->data, 0, sizeof(e_sample->data));
 
+  bpf_ringbuf_submit(e_sample, 0);
+  return 0;
+}
+
+SEC("lsm/file_permission")
+int BPF_PROG(file_permission, struct file *file, int mask) {
+  // only monitor actual write requests (MAY_WRITE is 0x02)
+  if (!(mask & MAY_WRITE)) {
+    return 0;
+  }
+
+  u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+  u32 *whitelist_val = bpf_map_lookup_elem(&whitelist, &pid);
+  if (whitelist_val) {
+    if (*whitelist_val == PERM_WHITELIST) return 0;
+    if (*whitelist_val < TRIPWIRE_THRESHOLD) {
+      __sync_fetch_and_add(whitelist_val, 1);
+      return 0;
+    } else {
+      bpf_map_delete_elem(&whitelist, &pid);
+    }
+  }
+
+  if (bpf_map_lookup_elem(&blacklist, &pid))
+    return -1;
+
+  if (is_virtual_fs(file)) {
+    return 0;
+  }
+
+  // non-sleepable fast path: read the leaf filename directly from dentry
+  char leaf_buf[64] = {0};
+  struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
+  if (!dentry) {
+    return 0;
+  }
+  const unsigned char *name_ptr = BPF_CORE_READ(dentry, d_name.name);
+  if (!name_ptr) {
+    return 0;
+  }
+  bpf_probe_read_kernel_str(leaf_buf, sizeof(leaf_buf), name_ptr);
+
+  if (leaf_buf[0] == '\0') {
+    return 0;
+  }
+
+  struct event_sample *e_sample = bpf_ringbuf_reserve(&event_rb, sizeof(struct event_sample), 0);
+  if (!e_sample) {
+    return 0;
+  }
+
+  e_sample->pid = pid;
+  e_sample->timestamp = bpf_ktime_get_ns();
+  e_sample->event_type = EVENT_FILE_WRITE;
+
+  bpf_get_current_comm(&e_sample->comm, sizeof(e_sample->comm));
+  __builtin_memset(&e_sample->data, 0, sizeof(e_sample->data));
+
+  e_sample->data.fopen_data.flags = mask;
+
+  // save the leaf filename into the event sample path structure
+  bpf_probe_read_str(e_sample->data.fopen_data.path,
+                     sizeof(e_sample->data.fopen_data.path),
+                     leaf_buf);
+
+  bpf_ringbuf_submit(e_sample, 0);
+  return 0;
+}
+
+SEC("lsm.s/path_unlink")
+int BPF_PROG(path_unlink, const struct path *dir, struct dentry *dentry) {
+  u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+  u32 *whitelist_val = bpf_map_lookup_elem(&whitelist, &pid);
+  if (whitelist_val) {
+    if (*whitelist_val == PERM_WHITELIST) return 0;
+    if (*whitelist_val < TRIPWIRE_THRESHOLD) {
+      __sync_fetch_and_add(whitelist_val, 1);
+      return 0;
+    } else {
+      bpf_map_delete_elem(&whitelist, &pid);
+    }
+  }
+  if (bpf_map_lookup_elem(&blacklist, &pid))
+    return -1;
+
+  // pre-allocate the event sample in the ring buffer
+  struct event_sample *e_sample = bpf_ringbuf_reserve(&event_rb, sizeof(struct event_sample), 0);
+  if (!e_sample) {
+    return 0;
+  }
+
+  e_sample->pid = pid;
+  e_sample->timestamp = bpf_ktime_get_ns();
+  e_sample->event_type = EVENT_FILE_UNLINK;
+  bpf_get_current_comm(&e_sample->comm, sizeof(e_sample->comm));
+  __builtin_memset(&e_sample->data, 0, sizeof(e_sample->data));
+
+  // resolve parent directory directly into the ring buffer sample path
+  long len = bpf_d_path(dir, e_sample->data.fopen_data.path, sizeof(e_sample->data.fopen_data.path));
+  if (len < 0) {
+    bpf_ringbuf_discard(e_sample, 0);
+    return 0;
+  }
+
+  // concatenate "/" and the leaf filename directly.
+  // direct checks on the returned =len= prevent register splitting, keeping the verifier happy.
+  if (len > 0 && len < 192) {
+    e_sample->data.fopen_data.path[len] = '/';
+
+    const unsigned char *name_ptr = BPF_CORE_READ(dentry, d_name.name);
+    if (name_ptr) {
+      bpf_probe_read_kernel_str(&e_sample->data.fopen_data.path[len + 1], 63, name_ptr);
+    }
+  }
+
+  // run ignore matching on the reconstructed path
+  if (should_ignore_path(e_sample->data.fopen_data.path)) {
+    bpf_ringbuf_discard(e_sample, 0);
+    return 0;
+  }
+
+  // submit the sample
   bpf_ringbuf_submit(e_sample, 0);
   return 0;
 }
