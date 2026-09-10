@@ -337,8 +337,8 @@ impl ProcessTracker {
                         self.ui_log(
                             "INFO",
                             format!(
-                                "Whitelisting (temp {:?}). Details: {}",
-                                duration, diagnostic_log
+                                "Whitelisting (temp). Details: {}",
+                                diagnostic_log
                             ),
                         );
                         self.update_ui_proc(pid, &comm, "Whitelisted (Temp)", 0);
