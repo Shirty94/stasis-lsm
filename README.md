@@ -356,6 +356,61 @@ project is not.
 
 ---
 
+## What I took away
+
+Five things I know now that I didn't know at commit one. None of them are
+specific to ransomware detection; all of them are specific to writing eBPF.
+
+- **The verifier is the real API.** Half the interesting decisions in
+  `stasis_lsm.bpf.c` were made because of verifier constraints, not because
+  they were the natural way to write C. `bpf_loop(32, …)` for the prefix
+  filter, the `len > 0 && len < 192` guard in `path_unlink` that exists
+  solely to stop the verifier from splitting registers, the choice of a
+  plain array map over `LPM_TRIE` — all of these are the code you write
+  when the first question is "what will the verifier accept" instead of
+  "what is simplest." Getting into that habit was the single biggest shift.
+
+- **Sleepable vs. non-sleepable hooks constrain everything downstream.**
+  `bpf_d_path()` only works from sleepable LSM hooks. That one fact is why
+  `file_permission` can only see a leaf filename, and why the prefix
+  filter cannot use an LPM trie. A single "can I sleep here?" cascades
+  through the whole design. I did not appreciate this until I had written
+  three of the five hooks and had to restructure.
+
+- **A time-limited trust grant is a window an adversary can plan around.**
+  The temporary whitelist lasts 10–45 seconds, and while it is active the
+  kernel bypasses the process entirely. That makes it a target: behave
+  benignly long enough to earn the whitelist, then go full blast inside the
+  window. The tripwire counter is the answer to that. Every event under a
+  dynamic whitelist atomically increments the entry, and once it reaches the
+  threshold the entry is evicted and the process is back under full
+  monitoring. So a process that does nothing loses its whitelist to the
+  timer, and a process that does too much loses it to the counter. "Allowed"
+  is a state the process has to keep earning, not a place it can sit for the
+  length of a timer. The general principle: time-based expiry assumes the
+  adversary waits; activity-based expiry assumes they don't.
+
+- **PID recycling is a real attack surface.** The cleanup in both
+  `bprm_creds_for_exec` and `sched_process_exit` exists because a
+  stale whitelist entry might survive the process it was granted
+  to. Or even worse: a permanent whitelist entry could inadvertently
+  be hijacked by an attacker, should process cleanup fail for some
+  reason.
+
+- **Heuristics are the easy part; calibration is the hard part.** Four
+  weighted rules took an afternoon. Knowing whether they are *correct*
+  would take a labelled corpus, a measured false-positive and
+  false-negative rate, and more time than the project had. That is the
+  reason this is a proof-of-concept and not a detector, and it is the
+  part I would most want to get right next time.
+
+If I started over: a hash-based whitelist from commit one instead of path
+prefixes, a heuristic test harness before the TUI, and blocking before the
+dashboard. The TUI is the part a reader sees first and the part that would
+matter least in a working tool.
+
+---
+
 ## Contributing
 
 **There is no contribution process. Issues and pull requests are not
