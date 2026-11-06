@@ -20,6 +20,8 @@
 
 # Stasis-LSM
 
+![Stasis-LSM TUI demo](assets/stasis-lsm-demo.gif)
+
 A behavioural-ransomware-detection **learning project** built on Linux
 eBPF LSM hooks and Rust.
 
